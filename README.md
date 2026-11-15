@@ -44,15 +44,14 @@ to `stderr`, so `collector | your_reader` is safe.
     --benchmark-latency          Run latency experiments instead of collecting
 ```
 
-**Set `--poll-interval-secs 900` for a real run.** A full keyset walk takes ten
-minutes or more (700 pages and still counting at the last measurement), so a
-shorter interval means the reconciler never pauses between scans. The 30s default
-is only sensible for capped smoke tests.
+**`--poll-interval-secs`:** with CLOB discovery a full refresh takes about five
+seconds, so 60–300 s is comfortable and the 30 s default is fine for small runs.
+Only the Gamma fallback needs ~900 s, because its walk takes ten minutes or more.
 
 ## Architecture
 
 ```text
-Gamma REST ──> PolymarketCodec ──> ShardManager ──> socket workers (A/B per shard)
+CLOB REST ──> PolymarketCodec ──> ShardManager ──> socket workers (A/B per shard)
                                                           │
                                                           ▼
                                              mpsc<EngineMessage>
@@ -115,13 +114,14 @@ sharding, redundancy, failover, snapshots, SBE output — is shared.
 ## Testing
 
 ```bash
-cargo test                 # 24 tests
+cargo test                 # 26 tests (24 unit + 2 integration)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 Coverage includes: exact `1e6` parsing and its rejection cases, Gamma
-`clobTokenIds` in both wire shapes, single/batched frame decoding, level
+`clobTokenIds` in both wire shapes plus V2 `positionIds`, the CLOB market-index
+page shape, single/batched frame decoding, level
 insertion/modification/deletion, the SBE replay invariant over 20 deltas,
 generation filtering, failover with a reconciliation snapshot, activity-tier
 classification, and an end-to-end test that runs a local WebSocket server through
@@ -139,7 +139,8 @@ result for socket tuning on this network, are in
 - **Failover and watchdog thresholds were tuned on measured churn**, not on the numbers in the original outline: the failover lag is 2 s (not 150 ms) and `Active` means ≥30 messages per five minutes. A 10,000-symbol soak showed the original values produced ~31,800 failovers in three minutes.
 - **`--tokens-per-socket` above ~750 silently loses coverage.** The venue accepts an oversized subscription and serves only a handful of assets with no error (1,000/socket → 2 of 2,000 hydrated). 500 is the default and has hydrated 100% in every run. The collector warns if fewer than half the requested symbols produce data.
 - **Discovery uses the CLOB's own market index** (`clob.polymarket.com/sampling-simplified-markets`), with Gamma's keyset endpoint only as a fallback. Measured: **8,749 live markets / ~17.5k tokens in ~5 s** via CLOB versus **>8 minutes** via Gamma. `--poll-interval-secs` therefore does not need to exceed a ten-minute walk.
-- **Verified coverage**: the complete live universe (17,438 symbols) across 35 shards / 70 sockets, 0 dropped frames, clean SIGINT.
+- **Verified coverage**: the complete live universe (17,488 symbols) across 35 shards / 70 sockets, 100% hydration, 1.27M deltas, 0 dropped frames, 0 negative levels, 0 crossed books, clean SIGINT.
+- **Failover churn is bounded, not eliminated**: 8,326 switches in a 200 s complete-venue soak (~0.0024 per symbol per second), each of which writes a resync snapshot. A 30 s dwell and a 5 s silence gate keep it from oscillating, but raising the missed-update threshold further would reduce it at the cost of reacting later to a genuinely stalled feed.
 - **Gamma's 209,604-token figure overstates the live universe.** That walk counts every open candidate and player-prop market, including thousands that never trade. The CLOB's active index reports what is actually accepting orders.
 - **Gamma has two outcome-identifier shapes.** V2 markets expose `positionIds` (array); legacy markets expose `clobTokenIds` (array or JSON-encoded string). Both are handled; reading only the latter silently drops every V2 market.
 - **`--max-tokens` is a debugging aid**, not a production setting.

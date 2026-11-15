@@ -405,7 +405,7 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 1. **Sockets are built with `socket2` and handed to Tokio via `TcpSocket::from_std_stream`,** before the TLS handshake, so tuning applies to the handshake as well as the data path.
 2. **`TCP_QUICKACK` needs `libc`,** which is the one dependency added beyond the Phase 1 list, and only on Unix. It is applied best-effort: a failure costs latency, never correctness. The option is not sticky on some kernels, which is recorded in `LATENCY_DISCOVERIES.md`.
 3. **Racing dials before subscribing.** Candidates are ranked on `PING`/`PONG` while idle, so no order book traffic is mixed into the measurement, and only the winner ever receives a subscription.
-4. **Racing is bounded and optional.** `--race-connections` defaults to 4 and caps at 16; `1` disables it and does a single tuned dial. Ten probes separated by 50 ms bound warm-up to roughly 0.6 s, which matters at ~143 sockets.
+4. **Racing is bounded and optional.** `--race-connections` defaults to 4 and caps at 16; `1` disables it and does a single tuned dial. Ten probes separated by 50 ms bound warm-up to roughly 0.6 s, which matters once the shard count reaches tens of sockets.
 5. **Per-connection source-port binding is plumbed but off by default.** The kernel already assigns distinct ephemeral ports for Conn A and Conn B; the hook exists for hosts where RSS hashing collapses them.
 6. **`LATENCY_DISCOVERIES.md` is maintained from Phase 7 onward,** not written at the end: each technique is recorded with its rationale, its cost, and an explicit `[IMPLEMENTED]`/`[MEASURED]`/`[PENDING]` marker so unmeasured claims cannot be mistaken for results.
 
@@ -453,11 +453,13 @@ After the rate-based rule and a 5 s silence gate, the same soak produced **4,728
 
 A caveat on reading the failover count: a subset are *first-hydration arbitration*, not churn. Whichever connection delivers a symbol's snapshot first becomes active, and that is logged as a failover; it happens at most once per symbol. The 200-symbol smoke settled at exactly 100 switches with 200 snapshots (one per pair), while the 10,000-symbol soak sits below one switch per symbol.
 
-**Not exercised:** full scale. The venue reports at least 209,604 tokens and was still counting, which at 5,000/socket implies ~42 shards and ~84 sockets with redundancy. That remains the open risk, together with the ten-minute-plus discovery walk.
+**Not exercised:** rotation at full scale. After discovery moved to the CLOB index the complete venue was soaked end to end — 17,488 symbols, 35 shards, 70 sockets, 100% hydration, 0 dropped frames, clean shutdown — but that window was shorter than the 35-minute rotation lifetime. Rotation itself is verified at 40 sockets (39/39 promoted).
 
 ### 4.13 Time-to-First-Byte (Phase 9, post-soak)
 
-The complete-venue soak never reached streaming: discovery was still at 1,050 pages / 209,604 symbols when its eight-minute budget expired. Waiting for a full walk before subscribing therefore produces a collector that is silent for ten-plus minutes, which is unacceptable for a data collector.
+The first complete-venue soak never reached streaming: discovery ran through Gamma and was still at 1,050 pages / 209,604 symbols when its eight-minute budget expired. Waiting for a full walk before subscribing therefore produced a collector that was silent for ten-plus minutes.
+
+That motivated `--startup-tokens`. Discovery has since moved to the CLOB index (~5 s for the whole venue), so the flag defaults to `0` (all) and only matters for the slow Gamma fallback.
 
 `--startup-tokens` bounds the *initial* fetch only (default `0` = all). It exists for the slow Gamma fallback; with CLOB discovery a full fetch takes ~5 s, so the default no longer caps coverage. The reconciler still adds anything new on its next pass, and `--max-tokens` bounds the whole run for smoke tests.
 
@@ -516,7 +518,7 @@ Options:
 
 Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; Phase 7 adds `--race-connections`; Phase 8 adds `--benchmark-latency`.
 
-**At production scale, set `--poll-interval-secs 900` or more.** A poll walks the venue's entire keyset chain, which is sequential by construction: 700 pages (~70,000 markets) took eight minutes and had counted **139,604 tokens without finishing**. Anything shorter means the reconciler runs continuously. The 30s default is only appropriate for small or capped runs.
+**`--poll-interval-secs`:** with CLOB discovery a full refresh is about five seconds, so 60–300 s is comfortable. The 900 s figure only applies to the Gamma fallback, whose keyset walk is sequential and took over eight minutes for 1,050 pages without finishing. The 30s default is fine for small or capped runs.
 
 `--tokens-per-socket` defaults to **500**, and going much higher is unsafe: at 1,000+ the venue accepts the subscription frame but silently serves only a handful of assets (measured: 1,000/socket → 2 of 2,000 books hydrated; 5,000/socket → 188 of 17,438). 500 has hydrated 100% in every run, and 750 also worked. The live universe is ~17.5k tokens (the CLOB index), so 500/socket with redundancy 2 is ~70 sockets.
 

@@ -140,9 +140,10 @@ on exactly that log line and was wrong — hydration, not the subscribe
 acknowledgement, is the measurement that counts.
 
 500 is the default because it has hydrated 100% in every run (1,000/1,000,
-10,000/10,000, 17,438 across 35 shards). The collector now also warns after a
-minute if fewer than half the requested symbols produced data, so this class of
-silent loss shows up in `stderr` instead of in a quietly incomplete capture.
+10,000/10,000, and **17,488/17,488 across 35 shards** in the complete-venue
+soak). The collector also warns after a minute if fewer than half the requested
+symbols produced data, so this class of silent loss shows up in `stderr` instead
+of in a quietly incomplete capture.
 
 Consequences:
 
@@ -253,9 +254,15 @@ above is unproven here.
 
 ## 6. Soak findings — [MEASURED]
 
-A 10,000-symbol run (20 shards × 2 connections, rotation enabled, three minutes)
-produced 37 successful rotations, zero dropped frames and a clean SIGINT, but
-also **31,844 failovers and 7,115 watchdog resubscribes**.
+The first meaningful soak was a 10,000-symbol run (20 shards × 2 connections,
+rotation enabled, three minutes). It produced 37 successful rotations, zero
+dropped frames and a clean SIGINT, but also **31,844 failovers and 7,115
+watchdog resubscribes**.
+
+The complete-venue soak afterwards (17,488 symbols, 35 shards, 70 sockets, 200 s)
+ran clean — 100% hydration, zero dropped frames, zero structural errors — with
+**8,326 failovers and 970 resubscribes**, which is the same per-symbol rate as
+the tuned 10,000-symbol run (~0.0024/symbol/s) rather than a regression.
 
 That is the most useful result in this file, because it is a defect that small
 runs hid: every failover writes a resync snapshot, so the capture was dominated
