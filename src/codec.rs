@@ -85,6 +85,14 @@ pub trait VenueCodec: Send + Sync + 'static {
     /// WebSocket endpoint to connect to.
     fn ws_url(&self) -> &str;
 
+    /// Extra headers to send on the WebSocket upgrade request.
+    ///
+    /// Most venues need none, so the default is empty. Venues that authenticate
+    /// the handshake itself (Kalshi) override this.
+    fn ws_request_headers(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// How often to send [`Self::heartbeat_payload`], if the venue needs one.
     fn heartbeat_interval(&self) -> Option<Duration>;
 

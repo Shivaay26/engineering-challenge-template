@@ -145,6 +145,12 @@ pub struct StampedEnvelope {
 pub trait VenueCodec: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn ws_url(&self) -> &str;
+
+    /// Extra headers for the WebSocket upgrade request. Defaults to none.
+    fn ws_request_headers(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     fn heartbeat_interval(&self) -> Option<std::time::Duration>;
     fn heartbeat_payload(&self) -> Option<String>;
 
@@ -246,6 +252,19 @@ Implement `KalshiCodec` implementing `VenueCodec` to prove the generic core:
 - `encode_initial_subscribe()` $\rightarrow$ `{"id":<n>,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":[...]}}`. `encode_subscribe()` / `encode_unsubscribe()` use `update_subscription` with `add_markets` / `delete_markets`, since a connection holds a single `orderbook_delta` subscription.
 - `decode_text_frame()` $\rightarrow$ parses `"orderbook_snapshot"` (`yes_dollars_fp` / `no_dollars_fp`: arrays of `["0.0800","300.00"]` price/size pairs) and `"orderbook_delta"` (`price_dollars`, `delta_fp`, `side`), scaling every decimal string through `parse_scaled_1e6`. Kalshi's `yes` bids map to `Side::Buy` at `price`; `no` bids map to `Side::Sell` at `1_000_000 - price`; deltas use `is_absolute: false` because `delta_fp` is a relative change.
 - `heartbeat_interval()` / `heartbeat_payload()` $\rightarrow$ `None` (no client heartbeat needed); `"market_lifecycle_v2"` frames map to `NormalizedEvent::MarketLifecycle`.
+
+### 3.5 Implementation Decisions (Phases 2–3)
+
+Small decisions taken while implementing the codec layer, recorded here so the reasoning is not lost:
+
+1. **`VenueCodec::ws_request_headers()` is part of the trait, with a default of `Ok(vec![])`.** Kalshi authenticates the WebSocket *upgrade*, so a venue-neutral collector needs somewhere to put handshake headers. Defaulting to empty keeps Polymarket (and every future unauthenticated venue) from implementing anything, and keeps the trait object-safe.
+2. **The Kalshi codec deliberately takes no crypto dependency.** Signing would pull in `rsa`/`ed25519-dalek`/`ring` for a codec that cannot be run without an API key in this region. `ws_request_headers()` fails fast with an explicit error rather than opening an unauthenticated socket. The codec is still fully exercised at the decode/encode level by unit tests, which is what Extension 3 demonstrates.
+3. **A `book` frame with neither `bids` nor `asks` is rejected.** Polymarket omits an empty ladder on some versions, so a missing *one* side is read as empty — but a frame with no ladder at all is an error. Emitting an empty snapshot would silently wipe the local book, which is exactly the phantom-liquidity failure the challenge warns about.
+4. **`price_change.size == "0"` is not special-cased.** It flows through as `quantity = 0, is_absolute = true`, and the order book removes the level. This keeps the codec free of book semantics.
+5. **`new_market` / `market_resolved` read `assets_ids`, falling back to a single `asset_id`.** Polymarket has used both shapes; a missing symbol just yields no event rather than failing the socket.
+6. **Gamma filtering is `active == true && closed != true && enableOrderBook == true`.** Token IDs are deduplicated both within and across pages, and empty IDs are dropped.
+7. **Kalshi decoding accepts both payload generations.** Current responses use fixed-point strings (`yes_dollars_fp`, `no_dollars_fp`, `price_dollars`, `delta_fp`); legacy responses use integer cents (`yes`, `no`, `price`, `delta`). Both normalise to `1e6` via `parse_scaled_1e6` or `× 10_000` for cents. `ts_ms` is preferred over `sending_ts_ms`, then local arrival, because it is the exchange's recording time.
+8. **Tests beyond the mandatory §7 list.** Added lifecycle decoding, subscription-frame encoding, and Kalshi snapshot/delta/MVE coverage, because the venue layer is where protocol drift will show up first.
 
 ---
 
