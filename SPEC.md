@@ -372,6 +372,16 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 3. **Observed live run** (40 symbols, two sockets, 50s, 15s snapshots): 120 snapshots, 370 deltas, 40 hydrated books, 5,050 resting levels, **0 replay-invariant violations** when the capture was replayed. `examples/inspect.rs` performs that replay against any capture file.
 4. **`stdout` output is verified byte-clean.** With `--output` omitted and with `-o -`, the capture is exactly N × 1 MiB (`file` reports `data`), contains zero log text, and every status line appears on `stderr`.
 
+### 4.7 Implementation Decisions (Phase 5)
+
+1. **`EngineMessage` carries slot health, not just events.** Failover rule 3 ("the old slot is disconnected") cannot be inferred reliably from event timestamps, so workers send `EngineMessage::Disconnected { shard_id, slot, generation }` when a session dies. The consumer marks that slot down for every symbol on the shard and clears the flag on the next event.
+2. **Generations are per connection attempt.** Each worker increments a counter before every `connect_async`, stamps every envelope with it, and the consumer keeps the highest generation seen per `(shard, slot)`. Events from a retired socket (a make-before-break or reconnect straggler) are dropped rather than written.
+3. **The delta that triggers failover is folded into the reconciliation snapshot and not also emitted.** The snapshot already contains its effect, so emitting both would double-apply the change on replay. Order on switch is: apply to the standby book → decide → write snapshot → (no delta).
+4. **Deltas from the non-active slot are applied but never written.** Both books stay warm so a switch is instant, but only the active slot produces SBE output.
+5. **`ShardManager` sends every subscription change to all connections of a shard**, so `/` and `-` stay symmetric; a reconnect therefore re-subscribes the correct set. Placement is least-loaded, and `add`/`remove` still `send().await` so the reconciler only drops a symbol from `known` once a worker accepted the command.
+6. **`--redundancy` is clamped to 1..=2.** One connection disables failover entirely (useful for isolation/debugging and for venues where a second socket is pointless); two is the production default.
+7. **Density default is 500 symbols/socket** for the reason in Section 6. `test_failover_emits_reconciliation_snapshot` covers the switch itself, and `stale_generations_are_ignored` covers the retired-socket case.
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -412,7 +422,7 @@ voluntas-collector [OPTIONS]
 
 Options:
   -o, --output <PATH>              Output file path for AlignedSbeWriter; `-` (or omitting the flag) streams SBE bytes to stdout, any other value is a file path
-      --tokens-per-socket <N>      Max symbols per WebSocket shard [default: 150]
+      --tokens-per-socket <N>      Max symbols per WebSocket shard [default: 500]
       --redundancy <N>             Connections per shard (1 or 2) [default: 2]
       --race-connections <N>       Parallel TLS handshakes to race per slot [default: 4]
       --poll-interval-secs <N>     REST market discovery interval [default: 30]
@@ -424,7 +434,9 @@ Options:
 
 ```
 
-Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 ships `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; `--redundancy`, `--race-connections`, `--rotate-minutes` and `--benchmark-latency` follow in Phases 5-8.
+Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 adds `--redundancy`; `--race-connections`, `--rotate-minutes` and `--benchmark-latency` follow in Phases 6-8.
+
+`--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
 
 ### Graceful `SIGINT` / `SIGTERM` Shutdown Sequence
 

@@ -1,12 +1,8 @@
 //! One WebSocket session for a shard, plus its reconnect loop.
 //!
-//! This module is deliberately separate from `shard_manager` (Phase 5), which
-//! will own symbol-to-shard assignment and Conn A/B redundancy. Here a worker
-//! just: connect, subscribe, forward decoded events, keep the connection alive,
-//! and reconnect with backoff.
-//!
-//! The URL is a parameter rather than read from the codec so tests can point a
-//! worker at a local socket.
+//! Each shard runs `--redundancy` connections (Conn A = `Primary`,
+//! Conn B = `Standby`). Every connection attempt increments its generation, so
+//! the consumer can discard events from a retired socket.
 
 use std::{sync::Arc, time::Duration};
 
@@ -22,7 +18,10 @@ use tokio_tungstenite::tungstenite::{
     http::{HeaderName, HeaderValue},
 };
 
-use crate::codec::{ConnSlot, StampedEnvelope, VenueCodec};
+use crate::{
+    codec::{ConnSlot, StampedEnvelope, VenueCodec},
+    engine::EngineMessage,
+};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1_500);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -30,7 +29,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A session that lasted this long is considered healthy, so backoff resets.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
-/// Dynamic subscription changes sent from the reconciler to a worker.
+/// Dynamic subscription changes sent from the shard manager to a worker.
 #[derive(Debug)]
 pub enum SocketCommand {
     Subscribe(Vec<String>),
@@ -38,26 +37,33 @@ pub enum SocketCommand {
     Shutdown,
 }
 
-/// Runs one shard's socket until `shutdown` is set, reconnecting on failure.
+/// Runs one connection until `shutdown` is set, reconnecting on failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     shard_id: usize,
+    slot: ConnSlot,
     codec: Arc<dyn VenueCodec>,
     url: String,
     mut symbols: Vec<String>,
     mut commands: mpsc::Receiver<SocketCommand>,
-    events: mpsc::Sender<StampedEnvelope>,
+    events: mpsc::Sender<EngineMessage>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
+    // Increments per connection attempt; the consumer drops stale generations.
+    let mut generation = 0u64;
 
     loop {
         if *shutdown.borrow() {
             return;
         }
 
+        generation += 1;
         let started = std::time::Instant::now();
         let result = session(
             shard_id,
+            slot,
+            generation,
             codec.as_ref(),
             &url,
             &mut symbols,
@@ -70,15 +76,23 @@ pub async fn run(
         match result {
             Ok(()) => return,
             Err(error) => {
-                eprintln!("[shard {shard_id}] websocket error: {error:#}");
+                eprintln!("[shard {shard_id} {slot:?}] websocket error: {error:#}");
                 if *shutdown.borrow() {
                     return;
                 }
 
+                let _ = events
+                    .send(EngineMessage::Disconnected {
+                        shard_id,
+                        slot,
+                        generation,
+                    })
+                    .await;
+
                 if started.elapsed() >= HEALTHY_SESSION {
                     backoff = INITIAL_BACKOFF;
                 }
-                eprintln!("[shard {shard_id}] reconnecting in {backoff:?}");
+                eprintln!("[shard {shard_id} {slot:?}] reconnecting in {backoff:?}");
 
                 tokio::select! {
                     _ = time::sleep(backoff) => {}
@@ -95,13 +109,16 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     shard_id: usize,
+    slot: ConnSlot,
+    generation: u64,
     codec: &dyn VenueCodec,
     url: &str,
     symbols: &mut Vec<String>,
     commands: &mut mpsc::Receiver<SocketCommand>,
-    events: &mpsc::Sender<StampedEnvelope>,
+    events: &mpsc::Sender<EngineMessage>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut request = url.into_client_request()?;
@@ -112,12 +129,12 @@ async fn session(
     }
 
     let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
-    eprintln!("[shard {shard_id}] connected to {url}");
+    eprintln!("[shard {shard_id} {slot:?}] connected (gen {generation})");
 
     let initial = codec.encode_initial_subscribe(symbols)?;
     socket.send(Message::Text(initial.into())).await?;
     eprintln!(
-        "[shard {shard_id}] subscribed to {} symbol(s)",
+        "[shard {shard_id} {slot:?}] subscribed to {} symbol(s)",
         symbols.len()
     );
 
@@ -185,16 +202,18 @@ async fn session(
                                 for event in decoded {
                                     let envelope = StampedEnvelope {
                                         shard_id,
-                                        slot: ConnSlot::Primary,
-                                        generation: 0,
+                                        slot,
+                                        generation,
                                         event,
                                     };
-                                    if events.send(envelope).await.is_err() {
+                                    if events.send(EngineMessage::Event(envelope)).await.is_err() {
                                         return Ok(());
                                     }
                                 }
                             }
-                            Err(error) => eprintln!("[shard {shard_id}] dropping frame: {error:#}"),
+                            Err(error) => {
+                                eprintln!("[shard {shard_id} {slot:?}] dropping frame: {error:#}");
+                            }
                         }
                     }
                     Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,

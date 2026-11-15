@@ -1,46 +1,129 @@
 //! The single consumer: the only task that owns order book state and the SBE
 //! writer.
 //!
-//! WebSocket workers never touch book state; they only forward
-//! [`StampedEnvelope`]s over an mpsc channel. Keeping every write in one place
-//! makes it impossible to serialise a half-updated book, and avoids any
-//! `Arc<Mutex<OrderBook>>` between producers.
+//! WebSocket workers never touch book state; they only forward decoded events
+//! over an mpsc channel. Keeping every write in one place makes it impossible
+//! to serialise a half-updated book, and it is what makes cross-connection
+//! failover safe: switching the active slot and emitting the reconciliation
+//! snapshot happen inside the same actor.
 
 use std::{collections::HashMap, io::Write};
 
 use chrono::{DateTime, Utc};
 
 use crate::{
-    codec::{NormalizedEvent, StampedEnvelope},
-    engine::orderbook::OrderBook,
+    codec::{ConnSlot, NormalizedEvent, StampedEnvelope},
+    engine::{EngineMessage, orderbook::OrderBook},
     util::AlignedSbeWriter,
 };
 
-/// Per-symbol state held by the consumer.
-#[derive(Debug, Default)]
-struct TrackedSymbol {
-    book: OrderBook,
-    /// Most recent exchange timestamp seen, used as the snapshot's
-    /// `exchange_timestamp` so periodic snapshots do not lie about venue time.
-    last_exchange_ts: Option<DateTime<Utc>>,
+/// A standby connection must be ahead by more than this to be preferred.
+const FAILOVER_LAG_MS: i64 = 150;
+
+fn slot_index(slot: ConnSlot) -> usize {
+    match slot {
+        ConnSlot::Primary => 0,
+        ConnSlot::Standby => 1,
+    }
+}
+
+fn slot_from_index(index: usize) -> ConnSlot {
+    if index == 0 {
+        ConnSlot::Primary
+    } else {
+        ConnSlot::Standby
+    }
+}
+
+/// Per-symbol state: two completely isolated books, one per connection.
+#[derive(Debug)]
+struct SymbolState {
+    shard_id: usize,
+    books: [OrderBook; 2],
+    /// Index of the book currently used for output.
+    active: usize,
+    last_exchange_ts: [Option<DateTime<Utc>>; 2],
+    last_recv: [Option<std::time::Instant>; 2],
+    /// A connection dropped and has not produced an event since.
+    down: [bool; 2],
+    emitted_initial: bool,
+}
+
+impl SymbolState {
+    fn new(shard_id: usize) -> Self {
+        Self {
+            shard_id,
+            books: [OrderBook::default(), OrderBook::default()],
+            active: 0,
+            last_exchange_ts: [None, None],
+            last_recv: [None, None],
+            down: [false, false],
+            emitted_initial: false,
+        }
+    }
 }
 
 /// Applies normalized events to books and writes SBE messages.
 pub struct Consumer<W: Write> {
     writer: AlignedSbeWriter<W>,
-    books: HashMap<String, TrackedSymbol>,
+    symbols: HashMap<String, SymbolState>,
+    /// Highest generation accepted per `(shard, slot)`.
+    generations: HashMap<(usize, usize), u64>,
 }
 
 impl<W: Write> Consumer<W> {
     pub fn new(writer: AlignedSbeWriter<W>) -> Self {
         Self {
             writer,
-            books: HashMap::new(),
+            symbols: HashMap::new(),
+            generations: HashMap::new(),
         }
     }
 
-    /// Applies one event and writes the corresponding SBE message.
-    pub fn apply(&mut self, envelope: StampedEnvelope) -> anyhow::Result<()> {
+    /// Handles one message from a worker.
+    pub fn apply(&mut self, message: EngineMessage) -> anyhow::Result<()> {
+        match message {
+            EngineMessage::Event(envelope) => self.apply_event(envelope),
+            EngineMessage::Disconnected {
+                shard_id,
+                slot,
+                generation,
+            } => {
+                if !self.accept_generation(shard_id, slot, generation) {
+                    return Ok(());
+                }
+                let index = slot_index(slot);
+                for state in self.symbols.values_mut() {
+                    if state.shard_id == shard_id {
+                        state.down[index] = true;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Drops events from a connection generation that has been superseded.
+    fn accept_generation(&mut self, shard_id: usize, slot: ConnSlot, generation: u64) -> bool {
+        let seen = self
+            .generations
+            .entry((shard_id, slot_index(slot)))
+            .or_insert(generation);
+
+        if generation < *seen {
+            false
+        } else {
+            *seen = generation;
+            true
+        }
+    }
+
+    fn apply_event(&mut self, envelope: StampedEnvelope) -> anyhow::Result<()> {
+        if !self.accept_generation(envelope.shard_id, envelope.slot, envelope.generation) {
+            return Ok(());
+        }
+        let index = slot_index(envelope.slot);
+
         match envelope.event {
             NormalizedEvent::Snapshot {
                 symbol,
@@ -49,14 +132,24 @@ impl<W: Write> Consumer<W> {
                 bids,
                 asks,
             } => {
-                let tracked = self.books.entry(symbol.clone()).or_default();
-                tracked.book.apply_snapshot(&bids, &asks);
-                tracked.last_exchange_ts = Some(exchange_ts);
+                let state = self
+                    .symbols
+                    .entry(symbol.clone())
+                    .or_insert_with(|| SymbolState::new(envelope.shard_id));
 
-                let snapshot = tracked
-                    .book
-                    .to_snapshot_domain(&symbol, received_at, exchange_ts);
-                self.writer.write_msg(&snapshot)?;
+                state.down[index] = false;
+                state.last_recv[index] = Some(std::time::Instant::now());
+                state.books[index].apply_snapshot(&bids, &asks);
+                state.last_exchange_ts[index] = Some(exchange_ts);
+
+                if index == state.active {
+                    let snapshot =
+                        state.books[index].to_snapshot_domain(&symbol, received_at, exchange_ts);
+                    state.emitted_initial = true;
+                    self.writer.write_msg(&snapshot)?;
+                } else {
+                    Self::maybe_failover(&mut self.writer, &symbol, state, received_at)?;
+                }
             }
             NormalizedEvent::Delta {
                 symbol,
@@ -67,21 +160,33 @@ impl<W: Write> Consumer<W> {
                 is_absolute,
                 quantity,
             } => {
-                // Deltas for a symbol we never snapshotted are dropped: applying
-                // them would build a book from a partial state.
-                let Some(tracked) = self.books.get_mut(&symbol) else {
+                let Some(state) = self.symbols.get_mut(&symbol) else {
                     return Ok(());
                 };
-                if !tracked.book.is_hydrated() {
+
+                state.down[index] = false;
+                state.last_recv[index] = Some(std::time::Instant::now());
+
+                // Never build a book from deltas alone.
+                if !state.books[index].is_hydrated() {
                     return Ok(());
                 }
 
-                tracked
-                    .book
-                    .apply_delta(side, price_level, quantity, is_absolute);
-                tracked.last_exchange_ts = Some(exchange_ts);
+                state.books[index].apply_delta(side, price_level, quantity, is_absolute);
+                state.last_exchange_ts[index] = Some(exchange_ts);
 
-                let delta = tracked.book.to_delta_domain(
+                if index != state.active {
+                    // The triggering delta is folded into the reconciliation
+                    // snapshot, so it must not also be emitted.
+                    Self::maybe_failover(&mut self.writer, &symbol, state, received_at)?;
+                    return Ok(());
+                }
+
+                if !state.emitted_initial {
+                    return Ok(());
+                }
+
+                let delta = state.books[index].to_delta_domain(
                     &symbol,
                     received_at,
                     exchange_ts,
@@ -91,8 +196,6 @@ impl<W: Write> Consumer<W> {
                 self.writer.write_msg(&delta)?;
             }
             NormalizedEvent::MarketLifecycle { symbol, is_active } => {
-                // Subscription changes are driven by the REST reconciler; this is
-                // just an early hint, so log it for operators.
                 eprintln!(
                     "market {symbol} is now {}",
                     if is_active { "active" } else { "inactive" }
@@ -103,15 +206,64 @@ impl<W: Write> Consumer<W> {
         Ok(())
     }
 
-    /// Writes a full snapshot for every hydrated book.
+    /// Switches the active slot if the standby is healthy and the active is not.
+    ///
+    /// On switch, a full snapshot of the newly active book is written *before*
+    /// any of its deltas, because the two books can disagree after a dropped
+    /// message.
+    fn maybe_failover(
+        writer: &mut AlignedSbeWriter<W>,
+        symbol: &str,
+        state: &mut SymbolState,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let active = state.active;
+        let other = 1 - active;
+
+        if !state.books[other].is_hydrated() {
+            return Ok(());
+        }
+
+        let active_hydrated = state.books[active].is_hydrated();
+        let lagging = match (
+            state.last_exchange_ts[other],
+            state.last_exchange_ts[active],
+        ) {
+            (Some(new), Some(old)) => (new - old).num_milliseconds() > FAILOVER_LAG_MS,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let should_switch = !active_hydrated || lagging || state.down[active];
+
+        if !should_switch {
+            return Ok(());
+        }
+
+        state.active = other;
+        let exchange_ts = state.last_exchange_ts[other].unwrap_or(now);
+        let snapshot = state.books[other].to_snapshot_domain(symbol, now, exchange_ts);
+        state.emitted_initial = true;
+
+        eprintln!(
+            "[failover] {symbol}: {:?} -> {:?}",
+            slot_from_index(active),
+            slot_from_index(other)
+        );
+        writer.write_msg(&snapshot)?;
+
+        Ok(())
+    }
+
+    /// Writes a full snapshot for every hydated active book.
     pub fn write_periodic_snapshots(&mut self, now: DateTime<Utc>) -> anyhow::Result<()> {
-        let mut snapshots = Vec::with_capacity(self.books.len());
-        for (symbol, tracked) in &self.books {
-            if !tracked.book.is_hydrated() {
+        let mut snapshots = Vec::with_capacity(self.symbols.len());
+        for (symbol, state) in &self.symbols {
+            let index = state.active;
+            if !state.books[index].is_hydrated() {
                 continue;
             }
-            let exchange_ts = tracked.last_exchange_ts.unwrap_or(now);
-            snapshots.push(tracked.book.to_snapshot_domain(symbol, now, exchange_ts));
+            let exchange_ts = state.last_exchange_ts[index].unwrap_or(now);
+            snapshots.push(state.books[index].to_snapshot_domain(symbol, now, exchange_ts));
         }
 
         for snapshot in &snapshots {
@@ -128,7 +280,14 @@ impl<W: Write> Consumer<W> {
 
     /// Number of symbols currently tracked, hydrated or not. Test/diagnostics.
     pub fn tracked_symbols(&self) -> usize {
-        self.books.len()
+        self.symbols.len()
+    }
+
+    /// Which slot is currently driving output for `symbol`.
+    pub fn active_slot(&self, symbol: &str) -> Option<ConnSlot> {
+        self.symbols
+            .get(symbol)
+            .map(|state| slot_from_index(state.active))
     }
 }
 
@@ -139,7 +298,6 @@ mod tests {
     use super::*;
     use crate::{
         Side,
-        codec::ConnSlot,
         util::{
             AlignedSbeReader, OrderbookSchema,
             dtos::challenge_orderbook::{AnyMessage, PriceLevelUpdateDomain, SnapshotDomain},
@@ -151,16 +309,68 @@ mod tests {
 
     fn stamp(index: i64) -> DateTime<Utc> {
         DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap()
-            + Duration::microseconds(index)
+            + Duration::milliseconds(index)
     }
 
-    fn envelope(event: NormalizedEvent) -> StampedEnvelope {
-        StampedEnvelope {
+    fn envelope(slot: ConnSlot, generation: u64, event: NormalizedEvent) -> EngineMessage {
+        EngineMessage::Event(StampedEnvelope {
             shard_id: 0,
-            slot: ConnSlot::Primary,
-            generation: 0,
+            slot,
+            generation,
             event,
+        })
+    }
+
+    fn snapshot(
+        slot: ConnSlot,
+        at: DateTime<Utc>,
+        bids: &[(i64, i64)],
+        asks: &[(i64, i64)],
+    ) -> EngineMessage {
+        envelope(
+            slot,
+            1,
+            NormalizedEvent::Snapshot {
+                symbol: "TOKEN".to_owned(),
+                exchange_ts: at,
+                received_at: at,
+                bids: bids.to_vec(),
+                asks: asks.to_vec(),
+            },
+        )
+    }
+
+    fn delta(
+        slot: ConnSlot,
+        at: DateTime<Utc>,
+        side: Side,
+        price: i64,
+        quantity: i64,
+    ) -> EngineMessage {
+        envelope(
+            slot,
+            1,
+            NormalizedEvent::Delta {
+                symbol: "TOKEN".to_owned(),
+                exchange_ts: at,
+                received_at: at,
+                side,
+                price_level: price,
+                is_absolute: true,
+                quantity,
+            },
+        )
+    }
+
+    fn read_all(path: &std::path::Path) -> anyhow::Result<Vec<SnapshotDomain>> {
+        let mut reader = AlignedSbeReader::<OrderbookSchema>::open(path)?;
+        let mut snapshots = Vec::new();
+        while let Some(message) = reader.read_msg()? {
+            if let AnyMessage::Snapshot(decoded) = message {
+                snapshots.push(SnapshotDomain::try_from_decoder(decoded)?);
+            }
         }
+        Ok(snapshots)
     }
 
     #[test]
@@ -169,20 +379,156 @@ mod tests {
         let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
         let mut consumer = Consumer::new(writer);
 
-        consumer.apply(envelope(NormalizedEvent::Delta {
-            symbol: "TOKEN".to_owned(),
-            exchange_ts: stamp(0),
-            received_at: stamp(0),
-            side: Side::Buy,
-            price_level: 480_000,
-            is_absolute: true,
-            quantity: 1_000_000,
-        }))?;
+        consumer.apply(delta(
+            ConnSlot::Primary,
+            stamp(0),
+            Side::Buy,
+            480_000,
+            1_000_000,
+        ))?;
         consumer.flush()?;
 
-        // Nothing was hydrated, so no book was created and no bytes were written.
         assert_eq!(consumer.tracked_symbols(), 0);
         assert_eq!(std::fs::metadata(file.path())?.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generations_are_ignored() -> anyhow::Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
+        let mut consumer = Consumer::new(writer);
+
+        // Generation 2 hydrates the book.
+        consumer.apply(envelope(
+            ConnSlot::Primary,
+            2,
+            NormalizedEvent::Snapshot {
+                symbol: "TOKEN".to_owned(),
+                exchange_ts: stamp(0),
+                received_at: stamp(0),
+                bids: vec![(480_000, 1_000_000)],
+                asks: vec![],
+            },
+        ))?;
+
+        // Generation 1 is a retired socket; its delta must not be written.
+        consumer.apply(envelope(
+            ConnSlot::Primary,
+            1,
+            NormalizedEvent::Delta {
+                symbol: "TOKEN".to_owned(),
+                exchange_ts: stamp(1),
+                received_at: stamp(1),
+                side: Side::Buy,
+                price_level: 480_000,
+                is_absolute: true,
+                quantity: 9_000_000,
+            },
+        ))?;
+        consumer.flush()?;
+
+        let snapshots = read_all(file.path())?;
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].bids[0].quantity, 1_000_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_failover_emits_reconciliation_snapshot() -> anyhow::Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
+        let mut consumer = Consumer::new(writer);
+
+        let t0 = stamp(0);
+
+        // Both connections open with the same book.
+        let initial_bids = [(480_000, 30_000_000), (470_000, 12_000_000)];
+        let initial_asks = [(520_000, 25_000_000)];
+        consumer.apply(snapshot(
+            ConnSlot::Primary,
+            t0,
+            &initial_bids,
+            &initial_asks,
+        ))?;
+        consumer.apply(snapshot(
+            ConnSlot::Standby,
+            t0,
+            &initial_bids,
+            &initial_asks,
+        ))?;
+        assert_eq!(consumer.active_slot("TOKEN"), Some(ConnSlot::Primary));
+
+        // Conn A misses the deletion of 470_000 entirely.
+        // Conn B sees it, but is still behind the 150ms failover threshold.
+        consumer.apply(delta(
+            ConnSlot::Standby,
+            t0 + Duration::milliseconds(100),
+            Side::Buy,
+            470_000,
+            0,
+        ))?;
+        assert_eq!(
+            consumer.active_slot("TOKEN"),
+            Some(ConnSlot::Primary),
+            "must not fail over below the lag threshold"
+        );
+
+        // Conn B now proves it is ahead: failover plus reconciliation snapshot.
+        consumer.apply(delta(
+            ConnSlot::Standby,
+            t0 + Duration::milliseconds(300),
+            Side::Buy,
+            480_000,
+            20_000_000,
+        ))?;
+        assert_eq!(consumer.active_slot("TOKEN"), Some(ConnSlot::Standby));
+
+        // A subsequent delta from the new active slot is emitted normally.
+        consumer.apply(delta(
+            ConnSlot::Standby,
+            t0 + Duration::milliseconds(310),
+            Side::Sell,
+            520_000,
+            22_000_000,
+        ))?;
+        consumer.flush()?;
+
+        // Stream: A's snapshot, B's reconciliation snapshot, then the delta.
+        let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path())?;
+        let mut snapshots = Vec::new();
+        let mut deltas = Vec::new();
+        while let Some(message) = reader.read_msg()? {
+            match message {
+                AnyMessage::Snapshot(decoded) => {
+                    snapshots.push(SnapshotDomain::try_from_decoder(decoded)?)
+                }
+                AnyMessage::PriceLevelUpdate(decoded) => {
+                    deltas.push(PriceLevelUpdateDomain::try_from_decoder(decoded)?)
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(snapshots.len(), 2, "A initial + B reconciliation");
+        assert_eq!(deltas.len(), 1, "only the post-failover delta");
+
+        let reconciliation = &snapshots[1];
+        assert!(
+            !reconciliation
+                .bids
+                .iter()
+                .any(|level| level.price_level == 470_000),
+            "reconciliation snapshot must reflect B's deletion"
+        );
+        assert_eq!(reconciliation.bids.len(), 1);
+        assert_eq!(reconciliation.bids[0].quantity, 20_000_000);
+
+        assert_eq!(deltas[0].side, Side::Sell);
+        assert_eq!(deltas[0].price_level, 520_000);
+        assert_eq!(deltas[0].quantity, 22_000_000);
 
         Ok(())
     }
@@ -203,8 +549,6 @@ mod tests {
         let start = stamp(0);
         let first = book.to_snapshot_domain(symbol, start, start);
 
-        // Insertions, size modifications, deletions, and a relative delta, so
-        // both update styles are replayed.
         let operations: [(Side, i64, i64, bool); 20] = [
             (Side::Buy, 485_000, 4_000_000, true),
             (Side::Buy, 480_000, 31_000_000, true),
@@ -247,7 +591,6 @@ mod tests {
             final_snapshot
         };
 
-        // Replay the recorded stream and assert it converges on the same book.
         let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path())?;
 
         let Some(AnyMessage::Snapshot(decoded)) = reader.read_msg()? else {
@@ -276,7 +619,6 @@ mod tests {
             match message {
                 AnyMessage::PriceLevelUpdate(decoded) => {
                     let delta = PriceLevelUpdateDomain::try_from_decoder(decoded)?;
-                    // Persisted quantities are always post-update absolute sizes.
                     replayed.apply_delta(delta.side, delta.price_level, delta.quantity, true);
                     replayed_deltas += 1;
                 }

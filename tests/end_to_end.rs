@@ -12,9 +12,9 @@ use std::{sync::Arc, time::Duration};
 
 use engineering_challenge::{
     Side,
-    codec::VenueCodec,
+    codec::{ConnSlot, NormalizedEvent, VenueCodec},
     engine::{
-        Consumer,
+        Consumer, EngineMessage,
         socket::{self},
     },
     util::{
@@ -85,13 +85,14 @@ async fn worker_to_consumer_pipeline_writes_replayable_sbe() -> anyhow::Result<(
     let file = tempfile::NamedTempFile::new()?;
     let mut consumer = Consumer::new(AlignedSbeWriter::create(file.path(), CHUNK)?);
 
-    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let (events_tx, mut events_rx) = mpsc::channel::<EngineMessage>(16);
     let (commands_tx, commands_rx) = mpsc::channel(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let codec: Arc<dyn VenueCodec> = Arc::new(PolymarketCodec);
     let worker = tokio::spawn(socket::run(
         0,
+        ConnSlot::Primary,
         codec,
         format!("ws://{address}"),
         vec![TOKEN.to_owned()],
@@ -101,10 +102,10 @@ async fn worker_to_consumer_pipeline_writes_replayable_sbe() -> anyhow::Result<(
     ));
 
     for expected in 0..2 {
-        let envelope = time::timeout(Duration::from_secs(5), events_rx.recv())
+        let message = time::timeout(Duration::from_secs(5), events_rx.recv())
             .await?
             .unwrap_or_else(|| panic!("worker stopped before event {expected}"));
-        consumer.apply(envelope)?;
+        consumer.apply(message)?;
     }
 
     consumer.flush()?;
@@ -173,13 +174,14 @@ async fn worker_survives_a_malformed_frame() -> anyhow::Result<()> {
         }
     });
 
-    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let (events_tx, mut events_rx) = mpsc::channel::<EngineMessage>(16);
     let (commands_tx, commands_rx) = mpsc::channel(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let codec: Arc<dyn VenueCodec> = Arc::new(PolymarketCodec);
     let worker = tokio::spawn(socket::run(
         0,
+        ConnSlot::Primary,
         codec,
         format!("ws://{address}"),
         vec![TOKEN.to_owned()],
@@ -188,13 +190,15 @@ async fn worker_survives_a_malformed_frame() -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    let envelope = time::timeout(Duration::from_secs(5), events_rx.recv())
+    let message = time::timeout(Duration::from_secs(5), events_rx.recv())
         .await?
         .expect("a snapshot after the malformed frame");
-    assert!(matches!(
-        envelope.event,
-        engineering_challenge::codec::NormalizedEvent::Snapshot { .. }
-    ));
+    match message {
+        EngineMessage::Event(envelope) => {
+            assert!(matches!(envelope.event, NormalizedEvent::Snapshot { .. }));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
 
     let _ = shutdown_tx.send(true);
     time::timeout(Duration::from_secs(5), worker).await??;

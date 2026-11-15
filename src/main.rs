@@ -1,11 +1,11 @@
 //! Collector entry point: discover markets over REST, stream them over sharded
-//! WebSockets, and write SBE snapshots and deltas to stdout or a file.
+//! redundant WebSockets, and write SBE snapshots and deltas to stdout or a file.
 //!
 //! `stdout` carries binary SBE bytes only. Every status line goes to `stderr`
 //! via `eprintln!`, so the output can be piped straight into a replay tool.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,11 +16,8 @@ use anyhow::Context;
 use chrono::Utc;
 use clap::Parser;
 use engineering_challenge::{
-    codec::{StampedEnvelope, VenueCodec},
-    engine::{
-        Consumer,
-        socket::{self, SocketCommand},
-    },
+    codec::VenueCodec,
+    engine::{Consumer, EngineMessage, ShardManager},
     util::AlignedSbeWriter,
     venues::PolymarketCodec,
 };
@@ -34,8 +31,7 @@ use tokio::{
 const FILE_CHUNK: usize = 64 << 20;
 /// Small chunks to stdout so a pipe consumer sees data promptly.
 const STDOUT_CHUNK: usize = 1 << 20;
-const EVENT_CHANNEL_CAPACITY: usize = 8_192;
-const COMMAND_CHANNEL_CAPACITY: usize = 64;
+const EVENT_CHANNEL_CAPACITY: usize = 32_768;
 /// Venues front their REST API with CDNs that occasionally hand out an edge IP
 /// which resets connections, so startup discovery is retried.
 const DISCOVERY_ATTEMPTS: u32 = 5;
@@ -52,9 +48,14 @@ struct Cli {
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Maximum symbols subscribed per WebSocket connection.
-    #[arg(long, default_value_t = 150)]
+    /// Symbols subscribed per WebSocket connection. Scale this, not the socket
+    /// count: the collector derives shards from it.
+    #[arg(long, default_value_t = 500)]
     tokens_per_socket: usize,
+
+    /// Redundant connections per shard (1 = no failover, 2 = Conn A + Conn B).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+    redundancy: u8,
 
     /// REST market discovery interval, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -64,85 +65,9 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     snapshot_interval_secs: u64,
 
-    /// Optional cap on total symbols, for smoke tests.
+    /// Optional cap on total symbols, for smoke tests only.
     #[arg(long)]
     max_tokens: Option<usize>,
-}
-
-/// Tracks which shard owns each symbol and routes subscription changes.
-struct Router {
-    command_txs: Vec<mpsc::Sender<SocketCommand>>,
-    counts: Vec<usize>,
-    assignment: HashMap<String, usize>,
-    max_symbols: Option<usize>,
-}
-
-impl Router {
-    fn total(&self) -> usize {
-        self.counts.iter().sum()
-    }
-
-    fn least_loaded(&self) -> usize {
-        self.counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, count)| **count)
-            .map(|(shard, _)| shard)
-            .unwrap_or(0)
-    }
-
-    async fn add(&mut self, symbols: &[String]) {
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
-
-        for symbol in symbols {
-            if self.assignment.contains_key(symbol) {
-                continue;
-            }
-            if let Some(max) = self.max_symbols
-                && self.total() >= max
-            {
-                break;
-            }
-
-            let shard = self.least_loaded();
-            self.assignment.insert(symbol.clone(), shard);
-            self.counts[shard] += 1;
-            by_shard.entry(shard).or_default().push(symbol.clone());
-        }
-
-        for (shard, batch) in by_shard {
-            let count = batch.len();
-            if let Err(error) = self.command_txs[shard]
-                .send(SocketCommand::Subscribe(batch))
-                .await
-            {
-                eprintln!(
-                    "[router] shard {shard} is gone, dropped {count} subscription(s): {error}"
-                );
-            }
-        }
-    }
-
-    async fn remove(&mut self, symbols: &[String]) {
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
-
-        for symbol in symbols {
-            let Some(shard) = self.assignment.remove(symbol) else {
-                continue;
-            };
-            self.counts[shard] = self.counts[shard].saturating_sub(1);
-            by_shard.entry(shard).or_default().push(symbol.clone());
-        }
-
-        for (shard, batch) in by_shard {
-            if let Err(error) = self.command_txs[shard]
-                .send(SocketCommand::Unsubscribe(batch))
-                .await
-            {
-                eprintln!("[router] shard {shard} is gone: {error}");
-            }
-        }
-    }
 }
 
 #[tokio::main]
@@ -164,58 +89,50 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("initial market discovery failed")?;
     anyhow::ensure!(!symbols.is_empty(), "no tradable symbols found");
-    eprintln!("discovered {} symbols", symbols.len());
+
+    match cli.max_tokens {
+        Some(max) => eprintln!(
+            "discovered {} symbols (capped by --max-tokens {max})",
+            symbols.len()
+        ),
+        None => eprintln!("discovered {} symbols", symbols.len()),
+    }
 
     let writer = build_writer(cli.output.as_deref())?;
     let mut consumer = Consumer::new(writer);
 
-    let per_socket = cli.tokens_per_socket.max(1);
-    let chunks: Vec<Vec<String>> = symbols.chunks(per_socket).map(<[String]>::to_vec).collect();
-    eprintln!(
-        "opening {} websocket(s), at most {per_socket} symbols each",
-        chunks.len()
-    );
-
-    let (events_tx, mut events_rx) = mpsc::channel::<StampedEnvelope>(EVENT_CHANNEL_CAPACITY);
+    let (events_tx, mut events_rx) = mpsc::channel::<EngineMessage>(EVENT_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
 
-    let mut command_txs = Vec::with_capacity(chunks.len());
-    let mut counts = Vec::with_capacity(chunks.len());
-    let mut assignment = HashMap::with_capacity(symbols.len());
+    let manager = ShardManager::spawn(
+        Arc::clone(&codec),
+        &symbols,
+        cli.tokens_per_socket,
+        usize::from(cli.redundancy),
+        events_tx.clone(),
+        shutdown_rx.clone(),
+        &mut workers,
+    )
+    .with_max_symbols(cli.max_tokens);
 
-    for (shard_id, chunk) in chunks.into_iter().enumerate() {
-        for symbol in &chunk {
-            assignment.insert(symbol.clone(), shard_id);
-        }
-        counts.push(chunk.len());
-
-        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        command_txs.push(command_tx);
-
-        let codec = Arc::clone(&codec);
-        let url = codec.ws_url().to_owned();
-        let events = events_tx.clone();
-        let shutdown = shutdown_rx.clone();
-        workers.spawn(async move {
-            socket::run(shard_id, codec, url, chunk, command_rx, events, shutdown).await;
-        });
-    }
+    eprintln!(
+        "{} symbols -> {} shard(s) x {} connection(s), at most {} symbols each ({} sockets)",
+        manager.total_symbols(),
+        manager.shard_count(),
+        cli.redundancy,
+        cli.tokens_per_socket,
+        manager.connection_count()
+    );
 
     // Only the workers keep senders now, so the channel closes once they stop.
     drop(events_tx);
 
-    let router = Router {
-        command_txs,
-        counts,
-        assignment,
-        max_symbols: cli.max_tokens,
-    };
     let poller = tokio::spawn(reconcile_symbols(
         client,
         Arc::clone(&codec),
         symbols.into_iter().collect(),
-        router,
+        manager,
         Duration::from_secs(cli.poll_interval_secs.max(1)),
         shutdown_rx.clone(),
     ));
@@ -239,9 +156,9 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            envelope = events_rx.recv() => {
-                match envelope {
-                    Some(envelope) => consumer.apply(envelope)?,
+            message = events_rx.recv() => {
+                match message {
+                    Some(message) => consumer.apply(message)?,
                     None => {
                         eprintln!("all websockets stopped");
                         break;
@@ -264,9 +181,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             biased;
 
-            envelope = events_rx.recv(), if channel_open => {
-                match envelope {
-                    Some(envelope) => consumer.apply(envelope)?,
+            message = events_rx.recv(), if channel_open => {
+                match message {
+                    Some(message) => consumer.apply(message)?,
                     None => channel_open = false,
                 }
             }
@@ -342,7 +259,7 @@ async fn reconcile_symbols(
     client: reqwest::Client,
     codec: Arc<dyn VenueCodec>,
     mut known: HashSet<String>,
-    mut router: Router,
+    mut manager: ShardManager,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -359,7 +276,7 @@ async fn reconcile_symbols(
             }
 
             _ = ticker.tick() => {
-                match codec.fetch_active_symbols(&client, router.max_symbols).await {
+                match codec.fetch_active_symbols(&client, None).await {
                     Ok(latest) => {
                         let latest: HashSet<String> = latest.into_iter().collect();
 
@@ -378,8 +295,8 @@ async fn reconcile_symbols(
                             removed.len(),
                             latest.len()
                         );
-                        router.add(&added).await;
-                        router.remove(&removed).await;
+                        manager.add(&added).await;
+                        manager.remove(&removed).await;
                         known = latest;
                     }
                     Err(error) => eprintln!("symbol reconciliation failed: {error:#}"),
