@@ -33,9 +33,11 @@ const FILE_CHUNK: usize = 64 << 20;
 /// Small chunks to stdout so a pipe consumer sees data promptly.
 const STDOUT_CHUNK: usize = 1 << 20;
 const EVENT_CHANNEL_CAPACITY: usize = 32_768;
-/// Venues front their REST API with CDNs that occasionally hand out an edge IP
-/// which resets connections, so startup discovery is retried.
-const DISCOVERY_ATTEMPTS: u32 = 5;
+/// Startup discovery is retried: a network switch can take the resolver down for
+/// tens of seconds, and CDNs occasionally hand out an edge IP that resets
+/// connections. Eight attempts with 1s..16s backoff rides out roughly a minute
+/// of flakiness before giving up.
+const DISCOVERY_ATTEMPTS: u32 = 8;
 /// How often the consumer classifies symbol activity and checks for zombies.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -61,6 +63,10 @@ struct Cli {
     redundancy: u8,
 
     /// REST market discovery interval, in seconds.
+    ///
+    /// Each poll walks the venue's full market list, so at production scale this
+    /// should be well above the discovery duration: 300s is the recommended
+    /// value, and it is bounded below by the 30s default.
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
 
@@ -92,6 +98,28 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    match run(cli).await {
+        Ok(()) => Ok(()),
+        // A closed downstream (for example `collector | head`) is a normal way
+        // for a streaming process to finish, not a failure.
+        Err(error) if is_broken_pipe(&error) => {
+            eprintln!("downstream closed the output; exiting");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// True when the error chain contains an `EPIPE`.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let codec: Arc<dyn VenueCodec> = Arc::new(PolymarketCodec);
     let client = reqwest::Client::builder()
         .user_agent(concat!(
