@@ -105,7 +105,7 @@ or a crossed book.
 
 | Venue | Status |
 | --- | --- |
-| Polymarket | Primary. Gamma keyset discovery + CLOB WebSocket decoding, fully implemented and tested. |
+| Polymarket | Primary. CLOB market-index discovery + CLOB WebSocket decoding, fully implemented and tested. Gamma's keyset endpoint is a fallback. |
 | Kalshi | Compatibility proof for the generic codec layer. Decoding, MVE filtering and subscription framing are unit-tested; the signed handshake is intentionally not implemented, so it cannot be run without credentials. |
 
 Decoding is the only exchange-specific layer: `VenueCodec`. Everything else —
