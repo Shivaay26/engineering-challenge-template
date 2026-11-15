@@ -27,6 +27,7 @@ use crate::{
         consumer::MaintenanceSink,
         socket::{self, SocketCommand},
     },
+    net::NetConfig,
 };
 
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
@@ -83,6 +84,7 @@ impl ShardManager {
         tokens_per_socket: usize,
         redundancy: usize,
         rotation: Duration,
+        net: NetConfig,
         events: mpsc::Sender<EngineMessage>,
         shutdown: watch::Receiver<bool>,
         workers: &mut JoinSet<()>,
@@ -117,10 +119,12 @@ impl ShardManager {
                 let events = events.clone();
                 let shutdown = shutdown.clone();
                 let symbols = chunk.to_vec();
+                let net = net.clone();
 
                 workers.spawn(async move {
                     socket::run(
-                        shard_id, slot, codec, url, symbols, command_rx, events, shutdown, rotation,
+                        shard_id, slot, codec, url, symbols, command_rx, events, shutdown,
+                        rotation, net,
                     )
                     .await;
                 });

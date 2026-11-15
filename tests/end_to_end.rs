@@ -100,6 +100,7 @@ async fn worker_to_consumer_pipeline_writes_replayable_sbe() -> anyhow::Result<(
         events_tx,
         shutdown_rx,
         Duration::ZERO,
+        engineering_challenge::net::NetConfig::default(),
     ));
 
     for expected in 0..2 {
@@ -190,6 +191,7 @@ async fn worker_survives_a_malformed_frame() -> anyhow::Result<()> {
         events_tx,
         shutdown_rx,
         Duration::ZERO,
+        engineering_challenge::net::NetConfig::default(),
     ));
 
     let message = time::timeout(Duration::from_secs(5), events_rx.recv())

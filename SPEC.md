@@ -395,6 +395,15 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 7. **Jitter is `base ± base/7` capped at 5 minutes, derived from the clock rather than a PRNG**, so ~150 sockets do not rotate in lockstep. The standby slot is offset by a further half lifetime, so the two connections of a shard never rotate together — while one warms up, the other is still streaming. `--rotate-minutes 0` disables rotation entirely, which is what the short verification runs use.
 8. **Known cosmetic issue:** the venue sends `new_market` lifecycle frames on *both* connections, so each is logged twice. Subscriptions are driven by the REST reconciler, so this is only log noise; de-duplication belongs with the reconciler work.
 
+### 4.9 Implementation Decisions (Phase 7)
+
+1. **Sockets are built with `socket2` and handed to Tokio via `TcpSocket::from_std_stream`,** before the TLS handshake, so tuning applies to the handshake as well as the data path.
+2. **`TCP_QUICKACK` needs `libc`,** which is the one dependency added beyond the Phase 1 list, and only on Unix. It is applied best-effort: a failure costs latency, never correctness. The option is not sticky on some kernels, which is recorded in `LATENCY_DISCOVERIES.md`.
+3. **Racing dials before subscribing.** Candidates are ranked on `PING`/`PONG` while idle, so no order book traffic is mixed into the measurement, and only the winner ever receives a subscription.
+4. **Racing is bounded and optional.** `--race-connections` defaults to 4 and caps at 16; `1` disables it and does a single tuned dial. Ten probes separated by 50 ms bound warm-up to roughly 0.6 s, which matters at ~143 sockets.
+5. **Per-connection source-port binding is plumbed but off by default.** The kernel already assigns distinct ephemeral ports for Conn A and Conn B; the hook exists for hosts where RSS hashing collapses them.
+6. **`LATENCY_DISCOVERIES.md` is maintained from Phase 7 onward,** not written at the end: each technique is recorded with its rationale, its cost, and an explicit `[IMPLEMENTED]`/`[MEASURED]`/`[PENDING]` marker so unmeasured claims cannot be mistaken for results.
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -447,7 +456,7 @@ Options:
 
 ```
 
-Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; `--race-connections` and `--benchmark-latency` follow in Phases 7-8.
+Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; Phase 7 adds `--race-connections`; `--benchmark-latency` follows in Phase 8.
 
 `--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
 

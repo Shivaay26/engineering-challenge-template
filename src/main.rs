@@ -18,6 +18,7 @@ use clap::Parser;
 use engineering_challenge::{
     codec::VenueCodec,
     engine::{Consumer, EngineMessage, ShardManager},
+    net::NetConfig,
     util::AlignedSbeWriter,
     venues::PolymarketCodec,
 };
@@ -73,6 +74,11 @@ struct Cli {
     #[arg(long, default_value_t = 35)]
     rotate_minutes: u64,
 
+    /// Parallel TLS + WebSocket candidates to race per connection. 1 disables
+    /// racing; the fastest by p50 RTT is kept.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
+    race_connections: u8,
+
     /// Optional cap on total symbols, for smoke tests only.
     #[arg(long)]
     max_tokens: Option<usize>,
@@ -114,12 +120,17 @@ async fn main() -> anyhow::Result<()> {
     let mut workers = JoinSet::new();
 
     let rotation = Duration::from_secs(cli.rotate_minutes.saturating_mul(60));
+    let net = NetConfig {
+        race_candidates: usize::from(cli.race_connections).max(1),
+        ..NetConfig::default()
+    };
     let manager = ShardManager::spawn(
         Arc::clone(&codec),
         &symbols,
         cli.tokens_per_socket,
         usize::from(cli.redundancy),
         rotation,
+        net.clone(),
         events_tx.clone(),
         shutdown_rx.clone(),
         &mut workers,
@@ -130,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     consumer.set_maintenance(Arc::new(manager.clone()));
 
     eprintln!(
-        "{} symbols -> {} shard(s) x {} connection(s), at most {} symbols each ({} sockets, rotation {} min)",
+        "{} symbols -> {} shard(s) x {} connection(s), at most {} symbols each ({} sockets, rotation {}, {} racing candidate(s))",
         manager.total_symbols(),
         manager.shard_count(),
         cli.redundancy,
@@ -140,7 +151,8 @@ async fn main() -> anyhow::Result<()> {
             "disabled".to_owned()
         } else {
             format!("~{}", cli.rotate_minutes)
-        }
+        },
+        cli.race_connections
     );
 
     // Only the workers keep senders now, so the channel closes once they stop.

@@ -386,6 +386,7 @@ dependencies = [
  "ergo-sbe",
  "futures-util",
  "indexmap",
+ "libc",
  "rand",
  "reqwest",
  "serde",

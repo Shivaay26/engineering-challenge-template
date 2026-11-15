@@ -20,6 +20,9 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints.cargo]
 # The async/networking crates above are staged in Phase 1 and wired up in
 # Phases 2-8 (see SPEC.md). Remove this allow once they are all in use.

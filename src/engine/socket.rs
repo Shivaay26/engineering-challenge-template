@@ -18,29 +18,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-    net::TcpStream,
     sync::{mpsc, watch},
     time,
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        http::{HeaderName, HeaderValue},
-    },
-};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     codec::{ConnSlot, NormalizedEvent, StampedEnvelope, VenueCodec},
     engine::EngineMessage,
+    net::{
+        NetConfig,
+        tuned_ws::{self, WsSocket},
+    },
 };
-
-type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1_500);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -76,6 +69,7 @@ pub async fn run(
     events: mpsc::Sender<EngineMessage>,
     mut shutdown: watch::Receiver<bool>,
     rotation: Duration,
+    net: NetConfig,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     // Shared across rotation, so a replacement always outranks its predecessor.
@@ -98,6 +92,7 @@ pub async fn run(
             &events,
             &mut shutdown,
             rotation,
+            &net,
         )
         .await;
 
@@ -149,8 +144,15 @@ async fn session(
     events: &mpsc::Sender<EngineMessage>,
     shutdown: &mut watch::Receiver<bool>,
     rotation: Duration,
+    net: &NetConfig,
 ) -> anyhow::Result<()> {
-    let mut socket = connect(codec, url).await?;
+    let (mut socket, race) = tuned_ws::connect(codec, url, net).await?;
+    if let Some(outcome) = race {
+        eprintln!(
+            "[shard {shard_id} {slot:?}] raced {} connection(s), winner p50={:?} p99={:?}",
+            outcome.candidates, outcome.winner_p50, outcome.winner_p99
+        );
+    }
     let mut current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
     eprintln!("[shard {shard_id} {slot:?}] connected (gen {current_generation})");
 
@@ -228,7 +230,7 @@ async fn session(
             }
 
             _ = time::sleep_until(rotate_at), if rotating => {
-                match rotate(shard_id, slot, generation, codec, url, symbols, events, &mut socket).await {
+                match rotate(shard_id, slot, generation, codec, url, symbols, events, &mut socket, net).await {
                     Ok(new_generation) => {
                         current_generation = new_generation;
                         rotate_at = time::Instant::now()
@@ -302,8 +304,15 @@ async fn rotate(
     symbols: &[String],
     events: &mpsc::Sender<EngineMessage>,
     socket: &mut WsSocket,
+    net: &NetConfig,
 ) -> anyhow::Result<u64> {
-    let mut replacement = connect(codec, url).await?;
+    let (mut replacement, race) = tuned_ws::connect(codec, url, net).await?;
+    if let Some(outcome) = race {
+        eprintln!(
+            "[shard {shard_id} {slot:?}] rotation race: {} candidate(s), winner p50={:?} p99={:?}",
+            outcome.candidates, outcome.winner_p50, outcome.winner_p99
+        );
+    }
     let new_generation = next_generation(generation);
     let target = (symbols.len() * ROTATION_HYDRATION_PERCENT).div_ceil(100);
 
@@ -367,18 +376,6 @@ async fn rotate(
     *socket = replacement;
 
     Ok(new_generation)
-}
-
-async fn connect(codec: &dyn VenueCodec, url: &str) -> anyhow::Result<WsSocket> {
-    let mut request = url.into_client_request()?;
-    for (name, value) in codec.ws_request_headers()? {
-        let name = HeaderName::try_from(name.as_str())?;
-        let value = HeaderValue::try_from(value.as_str()).context("invalid header value")?;
-        request.headers_mut().insert(name, value);
-    }
-
-    let (socket, _response) = tokio_tungstenite::connect_async(request).await?;
-    Ok(socket)
 }
 
 /// `base` ± up to `base/7` (capped at 5 min), so many sockets do not rotate in
