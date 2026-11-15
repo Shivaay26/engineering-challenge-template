@@ -112,9 +112,14 @@ async fn session(
     }
 
     let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
+    eprintln!("[shard {shard_id}] connected to {url}");
 
     let initial = codec.encode_initial_subscribe(symbols)?;
     socket.send(Message::Text(initial.into())).await?;
+    eprintln!(
+        "[shard {shard_id}] subscribed to {} symbol(s)",
+        symbols.len()
+    );
 
     let mut heartbeat = codec.heartbeat_interval().map(|period| {
         let mut interval = time::interval(period);

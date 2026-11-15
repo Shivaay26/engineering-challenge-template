@@ -156,7 +156,12 @@ pub trait VenueCodec: Send + Sync + 'static {
     fn heartbeat_payload(&self) -> Option<String>;
 
     /// Fetches all currently active, tradable, non-MVE symbols from REST.
-    async fn fetch_active_symbols(&self, client: &reqwest::Client) -> anyhow::Result<Vec<String>>;
+    /// `max_symbols` stops pagination early, so smoke tests need not walk the venue.
+    async fn fetch_active_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>>;
 
     /// Encodes the initial subscription frame sent immediately upon WebSocket connect.
     fn encode_initial_subscribe(&self, symbols: &[String]) -> anyhow::Result<String>;
@@ -180,7 +185,7 @@ pub trait VenueCodec: Send + Sync + 'static {
 
 1. **Market Discovery (`fetch_active_symbols`):**
 
-- Paginate `GET [https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500&offset=](https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500&offset=){offset}` incrementing `offset += 500` until the returned JSON array is empty.
+- Paginate `GET https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=100`, passing the previous response's `next_cursor` back as `after_cursor`. Stop when `markets` is empty or `next_cursor` is absent. **The legacy `/markets` endpoint cannot be used for a full scan: it 422s with `offset too large, use /markets/keyset for deeper pagination` past roughly 2,100 rows, and the keyset endpoint rejects `offset` entirely and caps `limit` at 100.** Gamma silently ignores unknown query parameters, so `cursor=`/`next_cursor=` return page 1 forever — the parameter name must be exactly `after_cursor`.
 - Filter each market object:
 - Must have `enableOrderBook == Some(true)` (JSON key `"enableOrderBook"`).
 - Must have `closed != Some(true)` and `active == Some(true)`.
@@ -357,6 +362,15 @@ When `StampedEnvelope { shard_id, slot, generation, event }` arrives at the sing
 8. **Subscription diffs are applied with `send().await`,** so a symbol is only removed from the reconciler's `known` set once the owning worker accepted the command. A full channel delays the next poll instead of silently losing a subscription.
 9. **CLI flags land with the phase that implements them.** Phase 4 ships `--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`. `--redundancy`, `--race-connections`, `--rotate-minutes` and `--benchmark-latency` arrive in Phases 5-8, so the binary never advertises a flag it ignores.
 10. **`tests/end_to_end.rs` runs a local WebSocket server** and drives the real worker and consumer, because the development sandbox cannot reach Polymarket at all (egress is blocked). It asserts the written SBE reads back as the expected snapshot and delta, and that a malformed frame does not kill the connection.
+
+### 4.6 Live-Validation Findings (Phase 4)
+
+Verified against live Polymarket over a mobile hotspot (the campus network blocks the venue outright). Two findings changed the implementation:
+
+1. **Gamma market discovery must use keyset pagination.** The legacy `/markets` endpoint returns `422 {"error": "offset too large, use /markets/keyset for deeper pagination"}` past roughly 2,100 rows, so the original "increment `offset` by 500 until empty" plan silently missed most markets. `PolymarketCodec` now walks `/markets/keyset` with `after_cursor` at 100 rows per page. The parameter name is load-bearing: Gamma ignores unknown parameters silently, so `cursor=`/`next_cursor=` re-serve page 1 forever.
+2. **`fetch_active_symbols` takes `max_symbols`.** `--max-tokens` now bounds pagination itself instead of truncating after a full scan, so a smoke test makes one or two REST calls rather than dozens. Venues front their REST API with CDNs that hand out edge IPs which reset connections, so startup discovery retries 5 times with 1s..16s backoff, and the poller simply retries on the next tick.
+3. **Observed live run** (40 symbols, two sockets, 50s, 15s snapshots): 120 snapshots, 370 deltas, 40 hydrated books, 5,050 resting levels, **0 replay-invariant violations** when the capture was replayed. `examples/inspect.rs` performs that replay against any capture file.
+4. **`stdout` output is verified byte-clean.** With `--output` omitted and with `-o -`, the capture is exactly N × 1 MiB (`file` reports `data`), contains zero log text, and every status line appears on `stderr`.
 
 ---
 

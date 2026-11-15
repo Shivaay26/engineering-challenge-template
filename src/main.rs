@@ -36,6 +36,9 @@ const FILE_CHUNK: usize = 64 << 20;
 const STDOUT_CHUNK: usize = 1 << 20;
 const EVENT_CHANNEL_CAPACITY: usize = 8_192;
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
+/// Venues front their REST API with CDNs that occasionally hand out an edge IP
+/// which resets connections, so startup discovery is retried.
+const DISCOVERY_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -157,13 +160,9 @@ async fn main() -> anyhow::Result<()> {
         .context("building the HTTP client")?;
 
     eprintln!("discovering {} markets over REST", codec.name());
-    let mut symbols = codec
-        .fetch_active_symbols(&client)
+    let symbols = discover_with_retry(&client, codec.as_ref(), cli.max_tokens, DISCOVERY_ATTEMPTS)
         .await
         .context("initial market discovery failed")?;
-    if let Some(max) = cli.max_tokens {
-        symbols.truncate(max);
-    }
     anyhow::ensure!(!symbols.is_empty(), "no tradable symbols found");
     eprintln!("discovered {} symbols", symbols.len());
 
@@ -286,6 +285,41 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Retries startup discovery with exponential backoff.
+async fn discover_with_retry(
+    client: &reqwest::Client,
+    codec: &dyn VenueCodec,
+    max_symbols: Option<usize>,
+    attempts: u32,
+) -> anyhow::Result<Vec<String>> {
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        match codec.fetch_active_symbols(client, max_symbols).await {
+            Ok(symbols) => {
+                if symbols.is_empty() && attempt < attempts {
+                    eprintln!(
+                        "discovery attempt {attempt}/{attempts} returned no symbols, retrying"
+                    );
+                } else {
+                    return Ok(symbols);
+                }
+            }
+            Err(error) => {
+                eprintln!("discovery attempt {attempt}/{attempts} failed: {error:#}");
+                last_error = Some(error);
+            }
+        }
+
+        if attempt < attempts {
+            let backoff = Duration::from_secs(1 << (attempt - 1).min(4));
+            time::sleep(backoff).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("discovery returned no symbols")))
+}
+
 /// Streams SBE to stdout when no path (or `-`) is given, else to a file.
 fn build_writer(output: Option<&Path>) -> anyhow::Result<AlignedSbeWriter<Box<dyn Write + Send>>> {
     let (sink, chunk): (Box<dyn Write + Send>, usize) = match output {
@@ -325,13 +359,8 @@ async fn reconcile_symbols(
             }
 
             _ = ticker.tick() => {
-                match codec.fetch_active_symbols(&client).await {
+                match codec.fetch_active_symbols(&client, router.max_symbols).await {
                     Ok(latest) => {
-                        let mut latest: Vec<String> = latest.into_iter().collect();
-                        latest.sort_unstable();
-                        if let Some(max) = router.max_symbols {
-                            latest.truncate(max);
-                        }
                         let latest: HashSet<String> = latest.into_iter().collect();
 
                         let mut added: Vec<String> = latest.difference(&known).cloned().collect();

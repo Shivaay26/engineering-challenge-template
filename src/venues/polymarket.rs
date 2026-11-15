@@ -19,14 +19,25 @@ use crate::{
     codec::{NormalizedEvent, VenueCodec, parse_scaled_1e6},
 };
 
-const GAMMA_MARKETS_URL: &str = "https://gamma-api.polymarket.com/markets";
+const GAMMA_MARKETS_URL: &str = "https://gamma-api.polymarket.com/markets/keyset";
 const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const PAGE_SIZE: usize = 500;
+/// The keyset endpoint caps a page at 100 markets and rejects `offset`.
+const PAGE_SIZE: usize = 100;
 
 /// Polymarket's order book feed over the CLOB WebSocket.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PolymarketCodec;
+
+/// One page from Gamma's keyset `/markets/keyset` endpoint.
+#[derive(Debug, Deserialize)]
+struct MarketsPage {
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+    /// Absent on the last page.
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
 
 /// One market as returned by Gamma's `/markets` endpoint.
 ///
@@ -245,40 +256,59 @@ impl VenueCodec for PolymarketCodec {
         Some("PING".to_owned())
     }
 
-    async fn fetch_active_symbols(&self, client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+    async fn fetch_active_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>> {
         let mut seen = HashSet::new();
         let mut symbols = Vec::new();
-        let mut offset = 0;
+        let mut cursor: Option<String> = None;
 
         loop {
-            let page: Vec<GammaMarket> = client
-                .get(GAMMA_MARKETS_URL)
-                .query(&[
-                    ("active", "true".to_owned()),
-                    ("closed", "false".to_owned()),
-                    ("limit", PAGE_SIZE.to_string()),
-                    ("offset", offset.to_string()),
-                ])
+            let mut request = client.get(GAMMA_MARKETS_URL).query(&[
+                ("active", "true".to_owned()),
+                ("closed", "false".to_owned()),
+                ("limit", PAGE_SIZE.to_string()),
+            ]);
+            if let Some(cursor) = cursor.as_deref() {
+                request = request.query(&[("after_cursor", cursor.to_owned())]);
+            }
+
+            let page: MarketsPage = request
                 .send()
                 .await
-                .with_context(|| format!("Gamma markets request failed at offset {offset}"))?
+                .with_context(|| format!("Gamma markets request failed at cursor {cursor:?}"))?
                 .error_for_status()
-                .with_context(|| format!("Gamma markets returned an error at offset {offset}"))?
+                .with_context(|| format!("Gamma markets returned an error at cursor {cursor:?}"))?
                 .json()
                 .await
-                .with_context(|| format!("decoding Gamma markets page at offset {offset}"))?;
+                .with_context(|| format!("decoding Gamma markets page at cursor {cursor:?}"))?;
 
-            if page.is_empty() {
+            if page.markets.is_empty() {
                 break;
             }
 
-            for symbol in active_symbols(page) {
+            for symbol in active_symbols(page.markets) {
                 if seen.insert(symbol.clone()) {
                     symbols.push(symbol);
                 }
             }
 
-            offset += PAGE_SIZE;
+            if max_symbols.is_some_and(|max| symbols.len() >= max) {
+                break;
+            }
+
+            match page.next_cursor {
+                Some(next) if !next.is_empty() && Some(&next) != cursor.as_ref() => {
+                    cursor = Some(next);
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(max) = max_symbols {
+            symbols.truncate(max);
         }
 
         Ok(symbols)
@@ -381,6 +411,32 @@ mod tests {
             active_symbols(markets),
             vec!["111", "222", "333", "444", "555"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_polymarket_gamma_keyset_page_decoding() -> anyhow::Result<()> {
+        let page: MarketsPage = serde_json::from_str(
+            r#"{
+                "markets": [
+                    {
+                        "active": true,
+                        "closed": false,
+                        "enableOrderBook": true,
+                        "clobTokenIds": "[\"111\", \"222\"]"
+                    }
+                ],
+                "next_cursor": "abc"
+            }"#,
+        )?;
+        assert_eq!(page.markets.len(), 1);
+        assert_eq!(page.next_cursor.as_deref(), Some("abc"));
+
+        // The final page omits next_cursor entirely.
+        let last: MarketsPage = serde_json::from_str(r#"{"markets": []}"#)?;
+        assert!(last.markets.is_empty());
+        assert_eq!(last.next_cursor, None);
 
         Ok(())
     }

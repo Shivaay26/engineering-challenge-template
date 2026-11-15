@@ -100,7 +100,14 @@ pub trait VenueCodec: Send + Sync + 'static {
     fn heartbeat_payload(&self) -> Option<String>;
 
     /// Fetches all currently active, tradable, non-MVE symbols from REST.
-    async fn fetch_active_symbols(&self, client: &reqwest::Client) -> anyhow::Result<Vec<String>>;
+    ///
+    /// `max_symbols` stops pagination early once enough symbols are collected,
+    /// so smoke tests do not have to walk the entire venue.
+    async fn fetch_active_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>>;
 
     /// Encodes the initial subscription frame sent immediately upon WebSocket
     /// connect.

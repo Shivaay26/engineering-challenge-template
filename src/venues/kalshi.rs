@@ -250,7 +250,11 @@ impl VenueCodec for KalshiCodec {
         None
     }
 
-    async fn fetch_active_symbols(&self, client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+    async fn fetch_active_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>> {
         let mut symbols = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -280,10 +284,20 @@ impl VenueCodec for KalshiCodec {
                 }
             }
 
+            if max_symbols.is_some_and(|max| symbols.len() >= max) {
+                break;
+            }
+
             match page.cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() && Some(&next) != cursor.as_ref() => {
+                    cursor = Some(next);
+                }
                 _ => break,
             }
+        }
+
+        if let Some(max) = max_symbols {
+            symbols.truncate(max);
         }
 
         Ok(symbols)
