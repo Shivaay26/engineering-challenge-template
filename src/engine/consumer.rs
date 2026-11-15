@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Write,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -23,18 +23,34 @@ use crate::{
 };
 
 /// A standby connection must be ahead by more than this to be preferred.
-const FAILOVER_LAG_MS: i64 = 150;
+///
+/// The original 150 ms came from the challenge text, but measurement at 10,000
+/// symbols produced ~31,800 failovers in three minutes: at that scale the two
+/// feeds are routinely more than 150 ms out of phase on low-rate symbols, so the
+/// pair traded places continuously and every switch forced a resync snapshot.
+/// 2 s is hysteresis: a genuinely stalled feed accumulates far more than that,
+/// while ordinary inter-feed phase does not.
+const FAILOVER_LAG_MS: i64 = 2_000;
 /// ...and it must have delivered at least this many updates that the active
 /// connection never showed. Time alone is ambiguous: a quiet market is silent on
 /// both feeds, so a later arrival on the standby is not evidence of lag.
-const FAILOVER_MISSED_UPDATES: u32 = 2;
+///
+/// The value is 10, not 2: at 10,000 symbols a threshold of 2 fired ~18,800
+/// times in three minutes, because most markets update minutes apart and a
+/// single in-flight message already looks like a large timestamp gap.
+const FAILOVER_MISSED_UPDATES: u32 = 10;
+/// After a switch, ignore further lag-based switches for this long. Without a
+/// dwell the pair can alternate on every subsequent message.
+const FAILOVER_DWELL: Duration = Duration::from_secs(30);
 
 /// Rolling window used to classify a symbol's activity tier.
 const ACTIVITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
-/// `>= 6` messages in five minutes means the symbol should be updating often.
-const ACTIVE_THRESHOLD: usize = 6;
+/// `>= 30` messages in five minutes means the symbol should be updating often.
+/// The original 6 (one per 50 s) classified most of the venue as active and
+/// produced ~7,100 resubscribes in three minutes across 10,000 symbols.
+const ACTIVE_THRESHOLD: usize = 30;
 /// An active symbol with no message for this long is treated as a zombie.
-const ZOMBIE_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
+const ZOMBIE_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Never churn the same symbol's subscription more often than this.
 const RESUBSCRIBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bound per-symbol memory on hyperactive markets.
@@ -78,6 +94,7 @@ struct SymbolState {
     /// Arrival times inside the rolling activity window.
     rolling: VecDeque<Instant>,
     last_resubscribe_attempt: Option<Instant>,
+    last_failover: Option<Instant>,
 }
 
 impl SymbolState {
@@ -93,6 +110,7 @@ impl SymbolState {
             missed: 0,
             rolling: VecDeque::new(),
             last_resubscribe_attempt: None,
+            last_failover: None,
         }
     }
 
@@ -295,13 +313,18 @@ impl<W: Write> Consumer<W> {
                 (Some(_), None) => true,
                 _ => false,
             };
-        let should_switch = !active_hydrated || lagging || state.down[active];
+        let dwell_ok = state
+            .last_failover
+            .map(|at| at.elapsed() >= FAILOVER_DWELL)
+            .unwrap_or(true);
+        let should_switch = !active_hydrated || state.down[active] || (lagging && dwell_ok);
 
         if !should_switch {
             return Ok(());
         }
 
         state.active = other;
+        state.last_failover = Some(Instant::now());
         let exchange_ts = state.last_exchange_ts[other].unwrap_or(now);
         let snapshot = state.books[other].to_snapshot_domain(symbol, now, exchange_ts);
         state.emitted_initial = true;
@@ -569,8 +592,8 @@ mod tests {
         ))?;
         assert_eq!(consumer.active_slot("TOKEN"), Some(ConnSlot::Primary));
 
-        // Conn A misses the deletion of 470_000 entirely.
-        // Conn B sees it, but is still behind the 150ms failover threshold.
+        // Conn A misses the deletion of 470_000 and nine size updates.
+        // Conn B sees them, but nine missed messages are not yet enough.
         consumer.apply(delta(
             ConnSlot::Standby,
             t0 + Duration::milliseconds(100),
@@ -578,16 +601,27 @@ mod tests {
             470_000,
             0,
         ))?;
+
+        for step in 2..=8 {
+            consumer.apply(delta(
+                ConnSlot::Standby,
+                t0 + Duration::milliseconds(300 * i64::from(step)),
+                Side::Buy,
+                480_000,
+                10_000_000 + i64::from(step),
+            ))?;
+        }
+
         assert_eq!(
             consumer.active_slot("TOKEN"),
             Some(ConnSlot::Primary),
-            "must not fail over below the lag threshold"
+            "must not fail over below the missed-update threshold"
         );
 
-        // Conn B now proves it is ahead: failover plus reconciliation snapshot.
+        // The tenth missed update tips it over: failover plus reconciliation.
         consumer.apply(delta(
             ConnSlot::Standby,
-            t0 + Duration::milliseconds(300),
+            t0 + Duration::milliseconds(3_000),
             Side::Buy,
             480_000,
             20_000_000,
@@ -597,7 +631,7 @@ mod tests {
         // A subsequent delta from the new active slot is emitted normally.
         consumer.apply(delta(
             ConnSlot::Standby,
-            t0 + Duration::milliseconds(310),
+            t0 + Duration::milliseconds(3_010),
             Side::Sell,
             520_000,
             22_000_000,
@@ -661,14 +695,14 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         consumer.set_maintenance(sink.clone());
 
-        // Active tier: one snapshot plus five deltas = 6 arrivals in the window.
+        // Active tier: one snapshot plus 29 deltas = 30 arrivals in the window.
         consumer.apply(snapshot(
             ConnSlot::Primary,
             stamp(0),
             &[(480_000, 1_000_000)],
             &[],
         ))?;
-        for index in 1..=5 {
+        for index in 1..=29 {
             consumer.apply(delta(
                 ConnSlot::Primary,
                 stamp(index),
@@ -686,25 +720,31 @@ mod tests {
         );
 
         consumer.run_watchdog(now + std::time::Duration::from_secs(31));
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "31s of silence is below the 60s zombie threshold"
+        );
+
+        consumer.run_watchdog(now + std::time::Duration::from_secs(61));
         let actions = sink.0.lock().unwrap().clone();
-        assert_eq!(actions.len(), 1, "one resubscribe after 30s of silence");
+        assert_eq!(actions.len(), 1, "one resubscribe after 60s of silence");
         assert_eq!(actions[0], (0, ConnSlot::Primary, "TOKEN".to_owned()));
 
-        consumer.run_watchdog(now + std::time::Duration::from_secs(32));
+        consumer.run_watchdog(now + std::time::Duration::from_secs(62));
         assert_eq!(
             sink.0.lock().unwrap().len(),
             1,
             "cooldown must suppress a second attempt"
         );
 
-        consumer.run_watchdog(now + std::time::Duration::from_secs(100));
+        consumer.run_watchdog(now + std::time::Duration::from_secs(130));
         assert_eq!(
             sink.0.lock().unwrap().len(),
             2,
             "cooldown expired, so it may try again"
         );
 
-        // Quiet tier: five arrivals in five minutes is below the threshold.
+        // Quiet tier: 29 arrivals in five minutes is below the threshold.
         let file = tempfile::NamedTempFile::new()?;
         let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
         let mut quiet = Consumer::new(writer);
@@ -717,7 +757,7 @@ mod tests {
             &[(480_000, 1_000_000)],
             &[],
         ))?;
-        for index in 1..=4 {
+        for index in 1..=28 {
             quiet.apply(delta(
                 ConnSlot::Primary,
                 stamp(index),
@@ -726,7 +766,7 @@ mod tests {
                 1_000_000 + index,
             ))?;
         }
-        quiet.run_watchdog(Instant::now() + std::time::Duration::from_secs(31));
+        quiet.run_watchdog(Instant::now() + std::time::Duration::from_secs(120));
         assert!(
             quiet_sink.0.lock().unwrap().is_empty(),
             "quiet symbols must not be unsubscribed"
