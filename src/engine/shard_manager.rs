@@ -5,8 +5,15 @@
 //! receive identical subscriptions, so one connection stalling never stops the
 //! data flow. Both feed the single consumer, which decides which one is
 //! authoritative.
+//!
+//! The manager is a clonable handle: the REST reconciler and the consumer's
+//! watchdog both act through it without owning it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use tokio::{
     sync::{mpsc, watch},
@@ -17,6 +24,7 @@ use crate::{
     codec::{ConnSlot, VenueCodec},
     engine::{
         EngineMessage,
+        consumer::MaintenanceSink,
         socket::{self, SocketCommand},
     },
 };
@@ -29,8 +37,7 @@ struct SlotHandle {
     commands: mpsc::Sender<SocketCommand>,
 }
 
-/// Owns shard assignment and the command channels of every worker.
-pub struct ShardManager {
+struct Inner {
     slots: Vec<SlotHandle>,
     /// Symbols assigned per shard, used for least-loaded placement.
     counts: Vec<usize>,
@@ -38,13 +45,44 @@ pub struct ShardManager {
     max_symbols: Option<usize>,
 }
 
+impl Inner {
+    fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    fn least_loaded(&self) -> usize {
+        self.counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, count)| **count)
+            .map(|(shard, _)| shard)
+            .unwrap_or(0)
+    }
+
+    fn senders_for(&self, shard: usize) -> Vec<mpsc::Sender<SocketCommand>> {
+        self.slots
+            .iter()
+            .filter(|handle| handle.shard_id == shard)
+            .map(|handle| handle.commands.clone())
+            .collect()
+    }
+}
+
+/// Owns shard assignment and the command channels of every worker.
+#[derive(Clone)]
+pub struct ShardManager {
+    inner: Arc<Mutex<Inner>>,
+}
+
 impl ShardManager {
     /// Packs `symbols` into shards and spawns `redundancy` workers per shard.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         codec: Arc<dyn VenueCodec>,
         symbols: &[String],
         tokens_per_socket: usize,
         redundancy: usize,
+        rotation: Duration,
         events: mpsc::Sender<EngineMessage>,
         shutdown: watch::Receiver<bool>,
         workers: &mut JoinSet<()>,
@@ -82,7 +120,7 @@ impl ShardManager {
 
                 workers.spawn(async move {
                     socket::run(
-                        shard_id, slot, codec, url, symbols, command_rx, events, shutdown,
+                        shard_id, slot, codec, url, symbols, command_rx, events, shutdown, rotation,
                     )
                     .await;
                 });
@@ -90,70 +128,76 @@ impl ShardManager {
         }
 
         Self {
-            slots,
-            counts,
-            assignment,
-            max_symbols: None,
+            inner: Arc::new(Mutex::new(Inner {
+                slots,
+                counts,
+                assignment,
+                max_symbols: None,
+            })),
         }
     }
 
-    pub fn with_max_symbols(mut self, max_symbols: Option<usize>) -> Self {
-        self.max_symbols = max_symbols;
+    pub fn with_max_symbols(self, max_symbols: Option<usize>) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.max_symbols = max_symbols;
+        }
         self
     }
 
     pub fn shard_count(&self) -> usize {
-        self.counts.len()
-    }
-
-    pub fn connection_count(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub fn total_symbols(&self) -> usize {
-        self.counts.iter().sum()
-    }
-
-    fn least_loaded(&self) -> usize {
-        self.counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, count)| **count)
-            .map(|(shard, _)| shard)
+        self.inner
+            .lock()
+            .map(|inner| inner.counts.len())
             .unwrap_or(0)
     }
 
+    pub fn connection_count(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.slots.len())
+            .unwrap_or(0)
+    }
+
+    pub fn total_symbols(&self) -> usize {
+        self.inner.lock().map(|inner| inner.total()).unwrap_or(0)
+    }
+
     /// Subscribes to new symbols on every connection of their shard.
-    pub async fn add(&mut self, symbols: &[String]) {
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
+    pub async fn add(&self, symbols: &[String]) {
+        let batches = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
 
-        for symbol in symbols {
-            if self.assignment.contains_key(symbol) {
-                continue;
-            }
-            if let Some(max) = self.max_symbols
-                && self.total_symbols() >= max
-            {
-                break;
-            }
-
-            let shard = self.least_loaded();
-            self.assignment.insert(symbol.clone(), shard);
-            self.counts[shard] += 1;
-            by_shard.entry(shard).or_default().push(symbol.clone());
-        }
-
-        for (shard, batch) in by_shard {
-            let count = batch.len();
-            for handle in self.slots.iter().filter(|handle| handle.shard_id == shard) {
-                if let Err(error) = handle
-                    .commands
-                    .send(SocketCommand::Subscribe(batch.clone()))
-                    .await
+            let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
+            for symbol in symbols {
+                if inner.assignment.contains_key(symbol) {
+                    continue;
+                }
+                if let Some(max) = inner.max_symbols
+                    && inner.total() >= max
                 {
+                    break;
+                }
+
+                let shard = inner.least_loaded();
+                inner.assignment.insert(symbol.clone(), shard);
+                inner.counts[shard] += 1;
+                by_shard.entry(shard).or_default().push(symbol.clone());
+            }
+
+            by_shard
+                .into_iter()
+                .map(|(shard, batch)| (batch, inner.senders_for(shard)))
+                .collect::<Vec<_>>()
+        };
+
+        for (batch, senders) in batches {
+            let count = batch.len();
+            for sender in senders {
+                if let Err(error) = sender.send(SocketCommand::Subscribe(batch.clone())).await {
                     eprintln!(
-                        "[shards] shard {shard} {:?} is gone, dropped {count} subscription(s): {error}",
-                        handle.slot
+                        "[shards] dropped {count} subscription(s) for a dead connection: {error}"
                     );
                 }
             }
@@ -161,27 +205,53 @@ impl ShardManager {
     }
 
     /// Unsubscribes symbols on every connection of their shard.
-    pub async fn remove(&mut self, symbols: &[String]) {
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
-
-        for symbol in symbols {
-            let Some(shard) = self.assignment.remove(symbol) else {
-                continue;
+    pub async fn remove(&self, symbols: &[String]) {
+        let batches = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
             };
-            self.counts[shard] = self.counts[shard].saturating_sub(1);
-            by_shard.entry(shard).or_default().push(symbol.clone());
-        }
 
-        for (shard, batch) in by_shard {
-            for handle in self.slots.iter().filter(|handle| handle.shard_id == shard) {
-                if let Err(error) = handle
-                    .commands
-                    .send(SocketCommand::Unsubscribe(batch.clone()))
-                    .await
-                {
-                    eprintln!("[shards] shard {shard} {:?} is gone: {error}", handle.slot);
+            let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
+            for symbol in symbols {
+                let Some(shard) = inner.assignment.remove(symbol) else {
+                    continue;
+                };
+                inner.counts[shard] = inner.counts[shard].saturating_sub(1);
+                by_shard.entry(shard).or_default().push(symbol.clone());
+            }
+
+            by_shard
+                .into_iter()
+                .map(|(shard, batch)| (batch, inner.senders_for(shard)))
+                .collect::<Vec<_>>()
+        };
+
+        for (batch, senders) in batches {
+            for sender in senders {
+                if let Err(error) = sender.send(SocketCommand::Unsubscribe(batch.clone())).await {
+                    eprintln!("[shards] dropped an unsubscribe for a dead connection: {error}");
                 }
             }
+        }
+    }
+}
+
+impl MaintenanceSink for ShardManager {
+    fn resubscribe(&self, shard_id: usize, slot: ConnSlot, symbol: &str) {
+        let sender = self.inner.lock().ok().and_then(|inner| {
+            inner
+                .slots
+                .iter()
+                .find(|handle| handle.shard_id == shard_id && handle.slot == slot)
+                .map(|handle| handle.commands.clone())
+        });
+
+        let Some(sender) = sender else {
+            return;
+        };
+
+        if let Err(error) = sender.try_send(SocketCommand::ResubscribeToken(symbol.to_owned())) {
+            eprintln!("[watchdog] could not queue resubscribe for {symbol}: {error}");
         }
     }
 }

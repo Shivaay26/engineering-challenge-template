@@ -35,6 +35,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 32_768;
 /// Venues front their REST API with CDNs that occasionally hand out an edge IP
 /// which resets connections, so startup discovery is retried.
 const DISCOVERY_ATTEMPTS: u32 = 5;
+/// How often the consumer classifies symbol activity and checks for zombies.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -64,6 +66,12 @@ struct Cli {
     /// Periodic full-snapshot interval, in seconds.
     #[arg(long, default_value_t = 60)]
     snapshot_interval_secs: u64,
+
+    /// Base connection lifetime before make-before-break rotation, in minutes.
+    /// 0 disables rotation. Jittered by up to +/- base/7 so sockets do not
+    /// rotate in lockstep.
+    #[arg(long, default_value_t = 35)]
+    rotate_minutes: u64,
 
     /// Optional cap on total symbols, for smoke tests only.
     #[arg(long)]
@@ -105,24 +113,34 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
 
+    let rotation = Duration::from_secs(cli.rotate_minutes.saturating_mul(60));
     let manager = ShardManager::spawn(
         Arc::clone(&codec),
         &symbols,
         cli.tokens_per_socket,
         usize::from(cli.redundancy),
+        rotation,
         events_tx.clone(),
         shutdown_rx.clone(),
         &mut workers,
     )
     .with_max_symbols(cli.max_tokens);
 
+    // The watchdog acts through the same handle the reconciler uses.
+    consumer.set_maintenance(Arc::new(manager.clone()));
+
     eprintln!(
-        "{} symbols -> {} shard(s) x {} connection(s), at most {} symbols each ({} sockets)",
+        "{} symbols -> {} shard(s) x {} connection(s), at most {} symbols each ({} sockets, rotation {} min)",
         manager.total_symbols(),
         manager.shard_count(),
         cli.redundancy,
         cli.tokens_per_socket,
-        manager.connection_count()
+        manager.connection_count(),
+        if cli.rotate_minutes == 0 {
+            "disabled".to_owned()
+        } else {
+            format!("~{}", cli.rotate_minutes)
+        }
     );
 
     // Only the workers keep senders now, so the channel closes once they stop.
@@ -147,6 +165,10 @@ async fn main() -> anyhow::Result<()> {
     let signal = wait_for_shutdown_signal();
     tokio::pin!(signal);
 
+    let mut watchdog = time::interval(WATCHDOG_INTERVAL);
+    watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    watchdog.tick().await;
+
     loop {
         tokio::select! {
             biased;
@@ -167,6 +189,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             _ = snapshots.tick() => consumer.write_periodic_snapshots(Utc::now())?,
+
+            _ = watchdog.tick() => consumer.run_watchdog(std::time::Instant::now()),
         }
     }
 
@@ -259,7 +283,7 @@ async fn reconcile_symbols(
     client: reqwest::Client,
     codec: Arc<dyn VenueCodec>,
     mut known: HashSet<String>,
-    mut manager: ShardManager,
+    manager: ShardManager,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {

@@ -7,7 +7,12 @@
 //! failover safe: switching the active slot and emitting the reconciliation
 //! snapshot happen inside the same actor.
 
-use std::{collections::HashMap, io::Write};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Write,
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -23,6 +28,23 @@ const FAILOVER_LAG_MS: i64 = 150;
 /// connection never showed. Time alone is ambiguous: a quiet market is silent on
 /// both feeds, so a later arrival on the standby is not evidence of lag.
 const FAILOVER_MISSED_UPDATES: u32 = 2;
+
+/// Rolling window used to classify a symbol's activity tier.
+const ACTIVITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+/// `>= 6` messages in five minutes means the symbol should be updating often.
+const ACTIVE_THRESHOLD: usize = 6;
+/// An active symbol with no message for this long is treated as a zombie.
+const ZOMBIE_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Never churn the same symbol's subscription more often than this.
+const RESUBSCRIBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bound per-symbol memory on hyperactive markets.
+const MAX_ROLLING_SAMPLES: usize = 512;
+
+/// Something that can act on a watchdog decision.
+pub trait MaintenanceSink: Send + Sync {
+    /// Unsubscribe then resubscribe `symbol` on one connection.
+    fn resubscribe(&self, shard_id: usize, slot: ConnSlot, symbol: &str);
+}
 
 fn slot_index(slot: ConnSlot) -> usize {
     match slot {
@@ -53,6 +75,9 @@ struct SymbolState {
     emitted_initial: bool,
     /// Events seen on the non-active slot since the active one last spoke.
     missed: u32,
+    /// Arrival times inside the rolling activity window.
+    rolling: VecDeque<Instant>,
+    last_resubscribe_attempt: Option<Instant>,
 }
 
 impl SymbolState {
@@ -66,6 +91,16 @@ impl SymbolState {
             down: [false, false],
             emitted_initial: false,
             missed: 0,
+            rolling: VecDeque::new(),
+            last_resubscribe_attempt: None,
+        }
+    }
+
+    /// Records one arrival for the activity watchdog.
+    fn record(&mut self, at: Instant) {
+        self.rolling.push_back(at);
+        if self.rolling.len() > MAX_ROLLING_SAMPLES {
+            self.rolling.pop_front();
         }
     }
 }
@@ -76,6 +111,7 @@ pub struct Consumer<W: Write> {
     symbols: HashMap<String, SymbolState>,
     /// Highest generation accepted per `(shard, slot)`.
     generations: HashMap<(usize, usize), u64>,
+    maintenance: Option<Arc<dyn MaintenanceSink>>,
 }
 
 impl<W: Write> Consumer<W> {
@@ -84,7 +120,13 @@ impl<W: Write> Consumer<W> {
             writer,
             symbols: HashMap::new(),
             generations: HashMap::new(),
+            maintenance: None,
         }
+    }
+
+    /// Installs the sink used to act on watchdog decisions.
+    pub fn set_maintenance(&mut self, sink: Arc<dyn MaintenanceSink>) {
+        self.maintenance = Some(sink);
     }
 
     /// Handles one message from a worker.
@@ -146,6 +188,7 @@ impl<W: Write> Consumer<W> {
 
                 state.down[index] = false;
                 state.last_recv[index] = Some(std::time::Instant::now());
+                state.record(Instant::now());
                 if index == state.active {
                     state.missed = 0;
                 } else {
@@ -178,6 +221,7 @@ impl<W: Write> Consumer<W> {
 
                 state.down[index] = false;
                 state.last_recv[index] = Some(std::time::Instant::now());
+                state.record(Instant::now());
                 if index == state.active {
                     state.missed = 0;
                 } else {
@@ -289,6 +333,52 @@ impl<W: Write> Consumer<W> {
         }
 
         Ok(())
+    }
+
+    /// Classifies each symbol's activity tier and asks for a single-connection
+    /// unsubscribe/resubscribe when an *active* symbol has gone silent.
+    ///
+    /// Quiet symbols are deliberately left alone: low activity is legitimate and
+    /// churn would only add risk. `now` is injected so tests can advance time.
+    pub fn run_watchdog(&mut self, now: Instant) {
+        let mut actions = Vec::new();
+
+        for (symbol, state) in &mut self.symbols {
+            while let Some(front) = state.rolling.front() {
+                if now.saturating_duration_since(*front) > ACTIVITY_WINDOW {
+                    state.rolling.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            if state.rolling.len() < ACTIVE_THRESHOLD {
+                continue;
+            }
+
+            let active = state.active;
+            let silent = state.last_recv[active]
+                .map(|at| now.saturating_duration_since(at) > ZOMBIE_SILENCE)
+                .unwrap_or(true);
+            let cooled_down = state
+                .last_resubscribe_attempt
+                .map(|at| now.saturating_duration_since(at) > RESUBSCRIBE_COOLDOWN)
+                .unwrap_or(true);
+
+            if silent && cooled_down {
+                state.last_resubscribe_attempt = Some(now);
+                actions.push((state.shard_id, slot_from_index(active), symbol.clone()));
+            }
+        }
+
+        let Some(sink) = &self.maintenance else {
+            return;
+        };
+
+        for (shard_id, slot, symbol) in actions {
+            eprintln!("[watchdog] {symbol} stalled on shard {shard_id} {slot:?}, resubscribing");
+            sink.resubscribe(shard_id, slot, &symbol);
+        }
     }
 
     /// Flushes the final chunk. Call once, on shutdown.
@@ -547,6 +637,100 @@ mod tests {
         assert_eq!(deltas[0].side, Side::Sell);
         assert_eq!(deltas[0].price_level, 520_000);
         assert_eq!(deltas[0].quantity, 22_000_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_activity_tier_classification() -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct RecordingSink(std::sync::Mutex<Vec<(usize, ConnSlot, String)>>);
+
+        impl MaintenanceSink for RecordingSink {
+            fn resubscribe(&self, shard_id: usize, slot: ConnSlot, symbol: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((shard_id, slot, symbol.to_owned()));
+            }
+        }
+
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
+        let mut consumer = Consumer::new(writer);
+        let sink = Arc::new(RecordingSink::default());
+        consumer.set_maintenance(sink.clone());
+
+        // Active tier: one snapshot plus five deltas = 6 arrivals in the window.
+        consumer.apply(snapshot(
+            ConnSlot::Primary,
+            stamp(0),
+            &[(480_000, 1_000_000)],
+            &[],
+        ))?;
+        for index in 1..=5 {
+            consumer.apply(delta(
+                ConnSlot::Primary,
+                stamp(index),
+                Side::Buy,
+                480_000,
+                1_000_000 + index,
+            ))?;
+        }
+
+        let now = Instant::now();
+        consumer.run_watchdog(now);
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "freshly updated symbol must not be churned"
+        );
+
+        consumer.run_watchdog(now + std::time::Duration::from_secs(31));
+        let actions = sink.0.lock().unwrap().clone();
+        assert_eq!(actions.len(), 1, "one resubscribe after 30s of silence");
+        assert_eq!(actions[0], (0, ConnSlot::Primary, "TOKEN".to_owned()));
+
+        consumer.run_watchdog(now + std::time::Duration::from_secs(32));
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            1,
+            "cooldown must suppress a second attempt"
+        );
+
+        consumer.run_watchdog(now + std::time::Duration::from_secs(100));
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            2,
+            "cooldown expired, so it may try again"
+        );
+
+        // Quiet tier: five arrivals in five minutes is below the threshold.
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
+        let mut quiet = Consumer::new(writer);
+        let quiet_sink = Arc::new(RecordingSink::default());
+        quiet.set_maintenance(quiet_sink.clone());
+
+        quiet.apply(snapshot(
+            ConnSlot::Primary,
+            stamp(0),
+            &[(480_000, 1_000_000)],
+            &[],
+        ))?;
+        for index in 1..=4 {
+            quiet.apply(delta(
+                ConnSlot::Primary,
+                stamp(index),
+                Side::Buy,
+                480_000,
+                1_000_000 + index,
+            ))?;
+        }
+        quiet.run_watchdog(Instant::now() + std::time::Duration::from_secs(31));
+        assert!(
+            quiet_sink.0.lock().unwrap().is_empty(),
+            "quiet symbols must not be unsubscribed"
+        );
 
         Ok(())
     }

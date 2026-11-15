@@ -384,6 +384,17 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 8. **Lag-based failover requires evidence of missed updates, not just a timestamp gap.** Comparing exchange timestamps alone made the two connections trade places on quiet markets: a 50-second live run produced 157 switches with only 3 socket errors, so this was a rule bug rather than connectivity. Failover on lag now requires the standby to have delivered **at least 2 updates since the active slot last spoke**, *and* to be more than 150ms ahead. A genuinely stalled primary accumulates missed updates immediately; a quiet market cannot accumulate them at all, because both feeds go quiet together. `Consumer::with_failover_silence` was removed once the count-based rule made the silence window unnecessary.
 9. **A resync is not an invariant violation.** When a failover snapshot or a post-reconnect venue `book` is emitted, the new snapshot is authoritative and may legitimately disagree with the state built from the previous feed — that is exactly why Extension 1 requires a snapshot on switch. `examples/inspect.rs` therefore reports `resync points` separately from structural corruption, and only fails on negative sizes or crossed books. The strict byte-equality invariant is demonstrated on a single-connection capture, where 120 snapshots and 370 deltas produced zero mismatches.
 
+### 4.8 Implementation Decisions (Phase 6)
+
+1. **Activity tiers use a rolling 5-minute window of arrival times**, pruned on every watchdog tick and capped at 512 samples per symbol so a hyperactive market cannot grow memory without bound. `>= 6` samples means `Active`; below that means `Quiet`.
+2. **Only `Active` symbols are ever churned.** A quiet symbol is silent because the market is quiet, so unsubscribing it would add risk for no benefit. An `Active` symbol is revived only when the active slot has produced nothing for 30s *and* the last resubscribe attempt was more than 60s ago, which is what prevents a resubscribe loop.
+3. **Revival is single-connection and local.** `SocketCommand::ResubscribeToken` performs `unsubscribe → 100ms → subscribe` on the one connection that stalled; the partner keeps streaming the symbol, so there is no observation gap.
+4. **The watchdog acts through `MaintenanceSink`, not through subscription state.** The consumer decides *when* a symbol looks dead; `ShardManager` owns routing and implements the sink. This keeps the consumer free of channel topology and lets the watchdog be tested against a recording sink.
+5. **Rotation is make-before-break and lives inside the worker task.** On the jittered deadline the worker connects a replacement, subscribes it, and forwards its events (tagged with a higher generation) while it warms up for up to 5s or until 95% of the shard's symbols have produced a snapshot. Only then is the old socket closed. A failed replacement is discarded and the healthy socket is kept — rotation must never cause an outage.
+6. **Generations are shared per `(shard, slot)` across rotations**, not reset by the new task, so a replacement always outranks its predecessor and late frames from the old socket are dropped by the consumer's generation gate rather than written.
+7. **Jitter is `base ± base/7` capped at 5 minutes, derived from the clock rather than a PRNG**, so ~150 sockets do not rotate in lockstep. The standby slot is offset by a further half lifetime, so the two connections of a shard never rotate together — while one warms up, the other is still streaming. `--rotate-minutes 0` disables rotation entirely, which is what the short verification runs use.
+8. **Known cosmetic issue:** the venue sends `new_market` lifecycle frames on *both* connections, so each is logged twice. Subscriptions are driven by the REST reconciler, so this is only log noise; de-duplication belongs with the reconciler work.
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -436,7 +447,7 @@ Options:
 
 ```
 
-Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 adds `--redundancy`; `--race-connections`, `--rotate-minutes` and `--benchmark-latency` follow in Phases 6-8.
+Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; `--race-connections` and `--benchmark-latency` follow in Phases 7-8.
 
 `--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
 

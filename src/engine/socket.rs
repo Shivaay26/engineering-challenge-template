@@ -1,39 +1,66 @@
-//! One WebSocket session for a shard, plus its reconnect loop.
+//! One WebSocket session for a shard, plus its reconnect and rotation loops.
 //!
 //! Each shard runs `--redundancy` connections (Conn A = `Primary`,
-//! Conn B = `Standby`). Every connection attempt increments its generation, so
-//! the consumer can discard events from a retired socket.
+//! Conn B = `Standby`). Every connection attempt increments a shared generation,
+//! so the consumer can discard events from a retired socket.
+//!
+//! Connections are also rotated on a jittered deadline. Rotation is
+//! *make-before-break*: the replacement connects, subscribes and warms up while
+//! the old socket keeps streaming, and only then is the old one closed. Without
+//! that ordering the collector would have a blind window on every rotation.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use anyhow::Context;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
+    net::TcpStream,
     sync::{mpsc, watch},
     time,
 };
-use tokio_tungstenite::tungstenite::{
-    Message,
-    client::IntoClientRequest,
-    http::{HeaderName, HeaderValue},
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::{HeaderName, HeaderValue},
+    },
 };
 
 use crate::{
-    codec::{ConnSlot, StampedEnvelope, VenueCodec},
+    codec::{ConnSlot, NormalizedEvent, StampedEnvelope, VenueCodec},
     engine::EngineMessage,
 };
+
+type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1_500);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A session that lasted this long is considered healthy, so backoff resets.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Gap between unsubscribe and subscribe when reviving one subscription.
+const RESUBSCRIBE_GAP: Duration = Duration::from_millis(100);
+/// How long a replacement connection may take to hydrate before we promote it.
+const ROTATION_WARMUP: Duration = Duration::from_secs(5);
+/// Fraction of a shard's symbols that must be hydrated before promoting.
+const ROTATION_HYDRATION_PERCENT: usize = 95;
 
 /// Dynamic subscription changes sent from the shard manager to a worker.
 #[derive(Debug)]
 pub enum SocketCommand {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
+    /// Unsubscribe then resubscribe a single symbol on this connection only.
+    ResubscribeToken(String),
     Shutdown,
 }
 
@@ -48,28 +75,29 @@ pub async fn run(
     mut commands: mpsc::Receiver<SocketCommand>,
     events: mpsc::Sender<EngineMessage>,
     mut shutdown: watch::Receiver<bool>,
+    rotation: Duration,
 ) {
     let mut backoff = INITIAL_BACKOFF;
-    // Increments per connection attempt; the consumer drops stale generations.
-    let mut generation = 0u64;
+    // Shared across rotation, so a replacement always outranks its predecessor.
+    let generation = Arc::new(AtomicU64::new(0));
 
     loop {
         if *shutdown.borrow() {
             return;
         }
 
-        generation += 1;
         let started = std::time::Instant::now();
         let result = session(
             shard_id,
             slot,
-            generation,
+            &generation,
             codec.as_ref(),
             &url,
             &mut symbols,
             &mut commands,
             &events,
             &mut shutdown,
+            rotation,
         )
         .await;
 
@@ -85,7 +113,7 @@ pub async fn run(
                     .send(EngineMessage::Disconnected {
                         shard_id,
                         slot,
-                        generation,
+                        generation: generation.load(Ordering::Relaxed),
                     })
                     .await;
 
@@ -113,23 +141,18 @@ pub async fn run(
 async fn session(
     shard_id: usize,
     slot: ConnSlot,
-    generation: u64,
+    generation: &AtomicU64,
     codec: &dyn VenueCodec,
     url: &str,
     symbols: &mut Vec<String>,
     commands: &mut mpsc::Receiver<SocketCommand>,
     events: &mpsc::Sender<EngineMessage>,
     shutdown: &mut watch::Receiver<bool>,
+    rotation: Duration,
 ) -> anyhow::Result<()> {
-    let mut request = url.into_client_request()?;
-    for (name, value) in codec.ws_request_headers()? {
-        let name = HeaderName::try_from(name.as_str())?;
-        let value = HeaderValue::try_from(value.as_str())?;
-        request.headers_mut().insert(name, value);
-    }
-
-    let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
-    eprintln!("[shard {shard_id} {slot:?}] connected (gen {generation})");
+    let mut socket = connect(codec, url).await?;
+    let mut current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!("[shard {shard_id} {slot:?}] connected (gen {current_generation})");
 
     let initial = codec.encode_initial_subscribe(symbols)?;
     socket.send(Message::Text(initial.into())).await?;
@@ -145,6 +168,9 @@ async fn session(
     });
     let has_heartbeat = heartbeat.is_some();
     let heartbeat_payload = codec.heartbeat_payload();
+
+    let rotating = !rotation.is_zero();
+    let mut rotate_at = time::Instant::now() + jittered(rotation) + rotation_offset(rotation, slot);
 
     loop {
         tokio::select! {
@@ -175,6 +201,19 @@ async fn session(
                             .await?;
                         symbols.retain(|symbol| !old_symbols.contains(symbol));
                     }
+                    Some(SocketCommand::ResubscribeToken(symbol)) => {
+                        socket
+                            .send(Message::Text(
+                                codec.encode_unsubscribe(std::slice::from_ref(&symbol))?.into(),
+                            ))
+                            .await?;
+                        time::sleep(RESUBSCRIBE_GAP).await;
+                        socket
+                            .send(Message::Text(
+                                codec.encode_subscribe(std::slice::from_ref(&symbol))?.into(),
+                            ))
+                            .await?;
+                    }
                     Some(SocketCommand::Shutdown) | None => {
                         close(&mut socket).await;
                         return Ok(());
@@ -185,6 +224,25 @@ async fn session(
             _ = next_tick(&mut heartbeat), if has_heartbeat => {
                 if let Some(payload) = &heartbeat_payload {
                     socket.send(Message::Text(payload.clone().into())).await?;
+                }
+            }
+
+            _ = time::sleep_until(rotate_at), if rotating => {
+                match rotate(shard_id, slot, generation, codec, url, symbols, events, &mut socket).await {
+                    Ok(new_generation) => {
+                        current_generation = new_generation;
+                        rotate_at = time::Instant::now()
+                            + jittered(rotation)
+                            + rotation_offset(rotation, slot);
+                    }
+                    Err(error) => {
+                        // Keep the healthy socket and try again later rather
+                        // than dropping into an unplanned reconnect.
+                        eprintln!("[shard {shard_id} {slot:?}] rotation failed, keeping current socket: {error:#}");
+                        rotate_at = time::Instant::now()
+                            + jittered(rotation)
+                            + rotation_offset(rotation, slot);
+                    }
                 }
             }
 
@@ -203,7 +261,7 @@ async fn session(
                                     let envelope = StampedEnvelope {
                                         shard_id,
                                         slot,
-                                        generation,
+                                        generation: current_generation,
                                         event,
                                     };
                                     if events.send(EngineMessage::Event(envelope)).await.is_err() {
@@ -222,6 +280,135 @@ async fn session(
                 }
             }
         }
+    }
+}
+
+/// Test-only escape hatch: a fresh generation for the replacement link.
+fn next_generation(generation: &AtomicU64) -> u64 {
+    generation.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Make-before-break: warm up a replacement, then close the current socket.
+///
+/// Events from the replacement are forwarded during warm-up, so the consumer
+/// sees its snapshots and performs the reconciliation itself.
+#[allow(clippy::too_many_arguments)]
+async fn rotate(
+    shard_id: usize,
+    slot: ConnSlot,
+    generation: &AtomicU64,
+    codec: &dyn VenueCodec,
+    url: &str,
+    symbols: &[String],
+    events: &mpsc::Sender<EngineMessage>,
+    socket: &mut WsSocket,
+) -> anyhow::Result<u64> {
+    let mut replacement = connect(codec, url).await?;
+    let new_generation = next_generation(generation);
+    let target = (symbols.len() * ROTATION_HYDRATION_PERCENT).div_ceil(100);
+
+    eprintln!(
+        "[shard {shard_id} {slot:?}] rotating to gen {new_generation}, warming up {} symbol(s)",
+        symbols.len()
+    );
+
+    replacement
+        .send(Message::Text(
+            codec.encode_initial_subscribe(symbols)?.into(),
+        ))
+        .await?;
+
+    let mut hydrated: HashSet<String> = HashSet::new();
+    let deadline = time::Instant::now() + ROTATION_WARMUP;
+
+    while hydrated.len() < target {
+        let remaining = deadline.saturating_duration_since(time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match time::timeout(remaining, replacement.next()).await {
+            Err(_) => break,
+            Ok(None) => anyhow::bail!("replacement socket closed during warm-up"),
+            Ok(Some(message)) => {
+                let Message::Text(text) = message? else {
+                    continue;
+                };
+                let Ok(decoded) = codec.decode_text_frame(text.as_str(), Utc::now()) else {
+                    continue;
+                };
+
+                for event in decoded {
+                    if let NormalizedEvent::Snapshot { symbol, .. } = &event {
+                        hydrated.insert(symbol.clone());
+                    }
+                    let envelope = StampedEnvelope {
+                        shard_id,
+                        slot,
+                        generation: new_generation,
+                        event,
+                    };
+                    if events.send(EngineMessage::Event(envelope)).await.is_err() {
+                        return Ok(new_generation);
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[shard {shard_id} {slot:?}] promoting gen {new_generation} ({}/{} hydrated), closing gen {current}",
+        hydrated.len(),
+        symbols.len(),
+        current = new_generation - 1
+    );
+
+    close(socket).await;
+    *socket = replacement;
+
+    Ok(new_generation)
+}
+
+async fn connect(codec: &dyn VenueCodec, url: &str) -> anyhow::Result<WsSocket> {
+    let mut request = url.into_client_request()?;
+    for (name, value) in codec.ws_request_headers()? {
+        let name = HeaderName::try_from(name.as_str())?;
+        let value = HeaderValue::try_from(value.as_str()).context("invalid header value")?;
+        request.headers_mut().insert(name, value);
+    }
+
+    let (socket, _response) = tokio_tungstenite::connect_async(request).await?;
+    Ok(socket)
+}
+
+/// `base` ± up to `base/7` (capped at 5 min), so many sockets do not rotate in
+/// lockstep. Jitter is derived from the clock rather than a PRNG to keep this
+/// module dependency-free.
+fn jittered(base: Duration) -> Duration {
+    let seconds = base.as_secs();
+    if seconds == 0 {
+        return Duration::ZERO;
+    }
+
+    let spread = (seconds / 7).min(300);
+    if spread == 0 {
+        return base;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+
+    base - Duration::from_secs(spread) + Duration::from_secs(nanos % (spread * 2 + 1))
+}
+
+/// Half a lifetime, so the two connections of a shard never rotate together:
+/// while one is warming up, the other is still streaming.
+fn rotation_offset(base: Duration, slot: ConnSlot) -> Duration {
+    match slot {
+        ConnSlot::Primary => Duration::ZERO,
+        ConnSlot::Standby => base / 2,
     }
 }
 
