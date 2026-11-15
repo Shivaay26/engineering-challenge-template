@@ -89,30 +89,74 @@ to keep hot.
 
 Measurements from live discovery and a live subscription run:
 
-- A keyset walk on WiFi scanned **700 pages (~70,000 markets) in eight minutes and
-  was still climbing**, having counted **139,604 unique tokens**. Every figure
-  here is a lower bound: the walk was stopped, not finished. The cursor chain is
-  sequential (the next page requires the previous page's cursor), so it cannot be
-  parallelised, and a page costs roughly 0.7 s.
-- Each market contributes two outcome tokens, hence tokens ≈ 2 × markets.
-- A 1,000-symbol run with `--tokens-per-socket 500` subscribed **500 assets on a
-  single connection without error**, and all 1,000 symbols hydrated across two
-  sockets (4,004 snapshots, 15,588 deltas, 66,569 resting levels).
+- A complete **Gamma** keyset walk **did not finish in eight minutes**: at 1,050
+  pages it had counted **209,604 unique tokens** and was still climbing. The
+  cursor chain is sequential (the next page requires the previous page's cursor),
+  so it cannot be parallelised, and a page costs roughly 0.46 s even with
+  compression.
+- The **CLOB** market index returns the live universe in **9 pages / ~5 s**:
+  **8,749 markets, all accepting orders, 17,498 tokens**. See the endpoint
+  comparison below — this is the single biggest performance finding in the
+  project.
+- A 1,000-symbol run with 500 assets per connection subscribed without error and
+  hydrated every symbol across two sockets (4,004 snapshots, 15,588 deltas,
+  66,569 resting levels).
+
+### The endpoint was the problem — [MEASURED]
+
+| Endpoint | Rows/page | Bytes/market | Live markets | Tokens | Time |
+| --- | --- | --- | --- | --- | --- |
+| `clob/sampling-simplified-markets` | **1,000** | **~535** | 8,749 | 17,498 | **~5 s** |
+| `clob/simplified-markets` | 1,000 | ~535 | 115 | 0 | >33 s (mostly dead markets) |
+| `gamma/markets/keyset` | 100 | ~6,500 | 100,000+ | 209,604+ | **>8 min, unfinished** |
+
+Gamma is the website/CMS API: it embeds a full description, rules, images and
+nested events per market, and hard-caps a page at 100 rows. The CLOB index is the
+matching engine's own list and returns identifiers only. Same venue, **~12× less
+data per market, 10× larger pages, ~100× faster end to end**.
+
+It also changes *what "all symbols" means*: Gamma's 209,604 tokens include
+thousands of auto-generated candidate and player-prop markets that never trade.
+The CLOB index reports the 17,498 tokens actually accepting orders.
+
+### The per-connection subscription ceiling — [MEASURED, and it fails silently]
+
+Density looked like a free win: fewer sockets, less memory. It is not, because
+**the venue accepts an oversized subscription frame and then serves only a
+handful of the requested assets, with no error.**
+
+| symbols/socket | requested | books hydrated |
+| --- | --- | --- |
+| 500 | 1,000 | **1,000** |
+| 750 | 2,000 | **2,000** |
+| 1,000 | 2,000 | **2** |
+| 5,000 | 1,000 | **4** |
+| 5,000 | 17,438 | **188** |
+
+The failure is invisible from the client side: the socket connects, logs
+`subscribed to 5000 symbol(s)`, never errors, and simply never delivers the
+books. An earlier claim in this file that 5,000/socket was "validated" was based
+on exactly that log line and was wrong — hydration, not the subscribe
+acknowledgement, is the measurement that counts.
+
+500 is the default because it has hydrated 100% in every run (1,000/1,000,
+10,000/10,000, 17,438 across 35 shards). The collector now also warns after a
+minute if fewer than half the requested symbols produced data, so this class of
+silent loss shows up in `stderr` instead of in a quietly incomplete capture.
 
 Consequences:
 
-- At 500 tokens/socket, ~140k tokens implies **~280 shards**, or **~560 sockets**
-  with redundancy 2. At the original 150/socket it would have been ~930 sockets.
-  This is the real scale of the base challenge, and it is the strongest argument
-  for both high density and a liquidity filter (see below).
-- Full discovery takes **ten minutes or more**, which is why
-  `--poll-interval-secs` must be well above the walk duration (900 s or more). A
-  30 s or 300 s poll interval would mean the reconciler never pauses between
-  walks.
-- Gamma's keyset endpoint supports `liquidity_num_min` / `volume_num_min`. Those
-  filters are the practical way to cut a 140k-token universe down to the markets
-  that actually trade; the collector does not apply them today, because the
-  challenge asks for all live symbols.
+- At 500/socket and redundancy 2, the live universe of ~17.5k tokens is **~35
+  shards / 70 sockets**, with ~140 MB of kernel receive buffers.
+- Higher density means fewer sockets but a larger recovery blast radius *and* a
+  risk of silent partial subscription above ~750.
+- Discovery was also bandwidth-bound before compression: a Gamma page is
+  **553 KB uncompressed** (6.5 KB per market) and **48 KB gzipped**, and
+  `reqwest` was built with `default-features = false`, silently disabling the
+  gzip feature. Enabling it cut a 10,000-symbol Gamma walk from ~100 s to 24 s.
+- With CLOB discovery, `--poll-interval-secs` no longer needs to exceed a
+  ten-minute walk; 60–300 s is comfortable. The 30 s default remains for small
+  or capped runs.
 
 ## 4. Empirical results — [MEASURED]
 

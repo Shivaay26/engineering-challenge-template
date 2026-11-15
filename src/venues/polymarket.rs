@@ -1,11 +1,20 @@
-//! Polymarket [`VenueCodec`]: Gamma REST market discovery and CLOB WebSocket
-//! order book decoding.
+//! Polymarket [`VenueCodec`]: market discovery and CLOB WebSocket order book
+//! decoding.
 //!
-//! This is the venue the collector is primarily built and run against, so the
-//! protocol quirks are handled explicitly rather than defensively: Gamma
-//! returns `clobTokenIds` in two different JSON shapes, the CLOB socket sends
-//! either a single object or an array of objects per text frame, and price
-//! levels are decimal strings that must never touch floating point.
+//! Discovery uses the **CLOB's own** market index
+//! (`clob.polymarket.com/sampling-simplified-markets`), not the website/CMS API
+//! on `gamma-api.polymarket.com`. The difference is not cosmetic:
+//!
+//! | Endpoint | Rows/page | Bytes/market | Markets | Time |
+//! | --- | --- | --- | --- | --- |
+//! | CLOB sampling | 1,000 | ~535 | 8,749 | ~5 s |
+//! | Gamma keyset | 100 | ~6,500 | 105,000+ | >8 min |
+//!
+//! Gamma embeds a full description, rules, images and nested events per market
+//! and hard-caps a page at 100, so a full walk is 1,000+ sequential requests.
+//! The CLOB index returns only the identifiers, and only markets that are
+//! actually accepting orders. Gamma remains as a fallback if the CLOB index is
+//! unavailable.
 
 use std::{collections::HashSet, time::Duration};
 
@@ -19,15 +28,105 @@ use crate::{
     codec::{NormalizedEvent, VenueCodec, parse_scaled_1e6},
 };
 
+const CLOB_MARKETS_URL: &str = "https://clob.polymarket.com/sampling-simplified-markets";
 const GAMMA_MARKETS_URL: &str = "https://gamma-api.polymarket.com/markets/keyset";
 const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// The keyset endpoint caps a page at 100 markets and rejects `offset`.
-const PAGE_SIZE: usize = 100;
+/// The CLOB index serves 1,000 markets per page.
+const CLOB_PAGE_SIZE: usize = 1_000;
+/// The Gamma keyset endpoint caps a page at 100 markets and rejects `offset`.
+const GAMMA_PAGE_SIZE: usize = 100;
+/// Attempts per page. Retrying the whole walk instead would throw away every
+/// page already fetched whenever a single request is reset.
+const PAGE_ATTEMPTS: u32 = 4;
 
 /// Polymarket's order book feed over the CLOB WebSocket.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PolymarketCodec;
+
+/// One page from the CLOB market index.
+#[derive(Debug, Deserialize)]
+struct ClobMarketsPage {
+    #[serde(default)]
+    data: Vec<ClobMarket>,
+    /// `LTE=` on the last page.
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// One market from the CLOB index: identifiers only, no prose.
+#[derive(Debug, Deserialize)]
+struct ClobMarket {
+    #[serde(default)]
+    tokens: Vec<ClobToken>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    accepting_orders: bool,
+    #[serde(default)]
+    archived: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClobToken {
+    #[serde(default)]
+    token_id: String,
+}
+
+/// Returns the tradable token ids of CLOB-indexed markets, in first-seen order.
+fn clob_active_symbols(markets: impl IntoIterator<Item = ClobMarket>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut symbols = Vec::new();
+
+    for market in markets {
+        let tradable =
+            market.active && !market.closed && market.accepting_orders && !market.archived;
+        if !tradable {
+            continue;
+        }
+
+        for token in market.tokens {
+            if !token.token_id.is_empty() && seen.insert(token.token_id.clone()) {
+                symbols.push(token.token_id);
+            }
+        }
+    }
+
+    symbols
+}
+
+/// Fetches one JSON page, retrying that request only.
+async fn fetch_page<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    label: &str,
+    url: &str,
+    query: &[(&str, String)],
+) -> anyhow::Result<T> {
+    let mut last_error = None;
+
+    for attempt in 1..=PAGE_ATTEMPTS {
+        match client.get(url).query(query).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<T>().await {
+                    Ok(page) => return Ok(page),
+                    Err(error) => {
+                        last_error = Some(anyhow::Error::new(error).context("decoding page"))
+                    }
+                },
+                Err(error) => last_error = Some(anyhow::Error::new(error)),
+            },
+            Err(error) => last_error = Some(anyhow::Error::new(error)),
+        }
+
+        if attempt < PAGE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{label} request failed")))
+}
 
 /// One page from Gamma's keyset `/markets/keyset` endpoint.
 #[derive(Debug, Deserialize)]
@@ -43,6 +142,11 @@ struct MarketsPage {
 ///
 /// Only the fields needed to decide whether to subscribe are kept; unknown
 /// fields are ignored by `serde`.
+///
+/// Outcome identifiers come in two shapes: Polymarket Protocol **V2** markets
+/// carry `positionIds` as a JSON array, while legacy **CTF** markets carry
+/// `clobTokenIds` (sometimes itself a JSON-encoded string). Reading only
+/// `clobTokenIds` silently drops every V2 market.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
@@ -54,6 +158,8 @@ struct GammaMarket {
     enable_order_book: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_clob_token_ids")]
     clob_token_ids: Vec<String>,
+    #[serde(default)]
+    position_ids: Vec<String>,
 }
 
 /// Gamma sometimes returns `clobTokenIds` as an array and sometimes as a
@@ -91,7 +197,15 @@ fn active_symbols(markets: impl IntoIterator<Item = GammaMarket>) -> Vec<String>
             continue;
         }
 
-        for token in market.clob_token_ids {
+        // V2 markets expose `positionIds`; legacy CTF markets expose
+        // `clobTokenIds`. Prefer whichever is present.
+        let token_ids = if market.position_ids.is_empty() {
+            market.clob_token_ids
+        } else {
+            market.position_ids
+        };
+
+        for token in token_ids {
             if !token.is_empty() && seen.insert(token.clone()) {
                 symbols.push(token);
             }
@@ -230,25 +344,9 @@ fn decode_value(value: &Value, received_at: DateTime<Utc>) -> anyhow::Result<Vec
     }
 }
 
-#[async_trait::async_trait]
-impl VenueCodec for PolymarketCodec {
-    fn name(&self) -> &'static str {
-        "polymarket"
-    }
-
-    fn ws_url(&self) -> &str {
-        CLOB_WS_URL
-    }
-
-    fn heartbeat_interval(&self) -> Option<Duration> {
-        Some(HEARTBEAT_INTERVAL)
-    }
-
-    fn heartbeat_payload(&self) -> Option<String> {
-        Some("PING".to_owned())
-    }
-
-    async fn fetch_active_symbols(
+impl PolymarketCodec {
+    /// Fast path: the CLOB's own active-market index, 1,000 rows per page.
+    async fn fetch_clob_symbols(
         &self,
         client: &reqwest::Client,
         max_symbols: Option<usize>,
@@ -259,24 +357,77 @@ impl VenueCodec for PolymarketCodec {
         let mut pages = 0usize;
 
         loop {
-            let mut request = client.get(GAMMA_MARKETS_URL).query(&[
-                ("active", "true".to_owned()),
-                ("closed", "false".to_owned()),
-                ("limit", PAGE_SIZE.to_string()),
-            ]);
+            let mut query = vec![("limit", CLOB_PAGE_SIZE.to_string())];
             if let Some(cursor) = cursor.as_deref() {
-                request = request.query(&[("after_cursor", cursor.to_owned())]);
+                query.push(("next_cursor", cursor.to_owned()));
             }
 
-            let page: MarketsPage = request
-                .send()
-                .await
-                .with_context(|| format!("Gamma markets request failed at cursor {cursor:?}"))?
-                .error_for_status()
-                .with_context(|| format!("Gamma markets returned an error at cursor {cursor:?}"))?
-                .json()
-                .await
-                .with_context(|| format!("decoding Gamma markets page at cursor {cursor:?}"))?;
+            let page: ClobMarketsPage =
+                fetch_page(client, "CLOB markets", CLOB_MARKETS_URL, &query).await?;
+
+            if page.data.is_empty() {
+                break;
+            }
+
+            pages += 1;
+            for symbol in clob_active_symbols(page.data) {
+                if seen.insert(symbol.clone()) {
+                    symbols.push(symbol);
+                }
+            }
+
+            if pages.is_multiple_of(5) {
+                eprintln!(
+                    "discovery: {pages} CLOB page(s), {} symbol(s) so far",
+                    symbols.len()
+                );
+            }
+
+            if max_symbols.is_some_and(|max| symbols.len() >= max) {
+                break;
+            }
+
+            match page.next_cursor {
+                Some(next)
+                    if !next.is_empty() && next != "LTE=" && Some(&next) != cursor.as_ref() =>
+                {
+                    cursor = Some(next);
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(max) = max_symbols {
+            symbols.truncate(max);
+        }
+
+        Ok(symbols)
+    }
+
+    /// Fallback: the Gamma keyset walk. Complete but an order of magnitude
+    /// slower, because each page carries full market prose and is capped at 100.
+    async fn fetch_gamma_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        let mut symbols = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let mut query = vec![
+                ("active", "true".to_owned()),
+                ("closed", "false".to_owned()),
+                ("limit", GAMMA_PAGE_SIZE.to_string()),
+            ];
+            if let Some(cursor) = cursor.as_deref() {
+                query.push(("after_cursor", cursor.to_owned()));
+            }
+
+            let page: MarketsPage =
+                fetch_page(client, "Gamma markets", GAMMA_MARKETS_URL, &query).await?;
 
             if page.markets.is_empty() {
                 break;
@@ -285,7 +436,7 @@ impl VenueCodec for PolymarketCodec {
             pages += 1;
             if pages.is_multiple_of(50) {
                 eprintln!(
-                    "discovery: {pages} pages scanned, {} symbol(s) so far",
+                    "discovery: {pages} Gamma page(s), {} symbol(s) so far",
                     symbols.len()
                 );
             }
@@ -313,6 +464,43 @@ impl VenueCodec for PolymarketCodec {
         }
 
         Ok(symbols)
+    }
+}
+
+#[async_trait::async_trait]
+impl VenueCodec for PolymarketCodec {
+    fn name(&self) -> &'static str {
+        "polymarket"
+    }
+
+    fn ws_url(&self) -> &str {
+        CLOB_WS_URL
+    }
+
+    fn heartbeat_interval(&self) -> Option<Duration> {
+        Some(HEARTBEAT_INTERVAL)
+    }
+
+    fn heartbeat_payload(&self) -> Option<String> {
+        Some("PING".to_owned())
+    }
+
+    async fn fetch_active_symbols(
+        &self,
+        client: &reqwest::Client,
+        max_symbols: Option<usize>,
+    ) -> anyhow::Result<Vec<String>> {
+        match self.fetch_clob_symbols(client, max_symbols).await {
+            Ok(symbols) if !symbols.is_empty() => Ok(symbols),
+            Ok(_) => {
+                eprintln!("discovery: CLOB index returned no symbols, falling back to Gamma");
+                self.fetch_gamma_symbols(client, max_symbols).await
+            }
+            Err(error) => {
+                eprintln!("discovery: CLOB index failed ({error:#}), falling back to Gamma");
+                self.fetch_gamma_symbols(client, max_symbols).await
+            }
+        }
     }
 
     fn encode_initial_subscribe(&self, symbols: &[String]) -> anyhow::Result<String> {
@@ -416,6 +604,104 @@ mod tests {
             active_symbols(markets),
             vec!["111", "222", "333", "444", "555"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_polymarket_clob_market_discovery_decoding() -> anyhow::Result<()> {
+        let page: ClobMarketsPage = serde_json::from_str(
+            r#"{
+                "data": [
+                    {
+                        "active": true,
+                        "closed": false,
+                        "accepting_orders": true,
+                        "archived": false,
+                        "tokens": [
+                            {"token_id": "111", "outcome": "Yes"},
+                            {"token_id": "222", "outcome": "No"}
+                        ]
+                    },
+                    {
+                        "active": true,
+                        "closed": false,
+                        "accepting_orders": false,
+                        "archived": false,
+                        "tokens": [{"token_id": "333"}]
+                    },
+                    {
+                        "active": false,
+                        "closed": false,
+                        "accepting_orders": true,
+                        "archived": false,
+                        "tokens": [{"token_id": "444"}]
+                    },
+                    {
+                        "active": true,
+                        "closed": false,
+                        "accepting_orders": true,
+                        "archived": true,
+                        "tokens": [{"token_id": "555"}]
+                    }
+                ],
+                "next_cursor": "aWQ6MjE1NTM1Nw==",
+                "limit": 1000
+            }"#,
+        )?;
+
+        assert_eq!(page.next_cursor.as_deref(), Some("aWQ6MjE1NTM1Nw=="));
+        // Only markets that are active, open, accepting orders and not archived.
+        assert_eq!(clob_active_symbols(page.data), vec!["111", "222"]);
+
+        // `LTE=` terminates the cursor chain.
+        let last: ClobMarketsPage = serde_json::from_str(r#"{"data": [], "next_cursor": "LTE="}"#)?;
+        assert!(last.data.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_polymarket_gamma_position_ids_v2_format() -> anyhow::Result<()> {
+        // Polymarket Protocol V2 markets expose `positionIds`; legacy CTF
+        // markets expose `clobTokenIds`. Both must be collected, or every V2
+        // market is silently dropped.
+        let markets: Vec<GammaMarket> = serde_json::from_str(
+            r#"[
+                {
+                    "version": "v2",
+                    "active": true,
+                    "closed": false,
+                    "enableOrderBook": true,
+                    "positionIds": [
+                        "651150819117105875331414918119047680898421632356043490229292782433651916800",
+                        "651150819117105875331414918119047680898421632356043490229292782433651916801"
+                    ]
+                },
+                {
+                    "active": true,
+                    "closed": false,
+                    "enableOrderBook": true,
+                    "clobTokenIds": "[\"111\", \"222\"]"
+                },
+                {
+                    "version": "v2",
+                    "active": true,
+                    "closed": false,
+                    "enableOrderBook": true,
+                    "positionIds": ["999"]
+                }
+            ]"#,
+        )?;
+
+        let symbols = active_symbols(markets);
+        assert_eq!(symbols.len(), 5, "both wire shapes must contribute");
+        assert_eq!(
+            symbols[0],
+            "651150819117105875331414918119047680898421632356043490229292782433651916800"
+        );
+        assert_eq!(symbols[2], "111");
+        assert_eq!(symbols[4], "999");
 
         Ok(())
     }

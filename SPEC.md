@@ -185,13 +185,18 @@ pub trait VenueCodec: Send + Sync + 'static {
 
 1. **Market Discovery (`fetch_active_symbols`):**
 
-- Paginate `GET https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=100`, passing the previous response's `next_cursor` back as `after_cursor`. Stop when `markets` is empty or `next_cursor` is absent. **The legacy `/markets` endpoint cannot be used for a full scan: it 422s with `offset too large, use /markets/keyset for deeper pagination` past roughly 2,100 rows, and the keyset endpoint rejects `offset` entirely and caps `limit` at 100.** Gamma silently ignores unknown query parameters, so `cursor=`/`next_cursor=` return page 1 forever — the parameter name must be exactly `after_cursor`.
+- **Primary discovery: the CLOB's own market index**, `GET https://clob.polymarket.com/sampling-simplified-markets?limit=1000[&next_cursor=...]`. It returns `{"data":[{tokens:[{token_id}],active,closed,accepting_orders,archived}],"next_cursor":"..."}` at **1,000 markets per page and ~535 bytes per market**. Stop when `data` is empty or `next_cursor` is `LTE=`. Measured: 8,749 markets / 17,498 tokens in ~5 seconds.
+- **Fallback discovery: Gamma keyset.** `GET https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=100`, passing `next_cursor` back as `after_cursor`. This is complete but an order of magnitude slower — ~6,500 bytes per market (full description, rules, images, nested events) and a hard 100-row page cap, so a full walk is 1,000+ sequential requests (~8+ minutes) and the venue reports 100,000+ markets. Use it only when the CLOB index is unavailable.
+- **Retry per page, not per walk.** A reset on page 400 must not discard 399 successful pages.
+- **Gamma quirks:** the legacy `/markets` endpoint 422s past ~2,100 rows (`offset too large, use /markets/keyset`), the keyset endpoint rejects `offset`, and Gamma **silently ignores unknown query parameters** — `cursor=`/`next_cursor=` re-serve page 1 forever, so the name must be exactly `after_cursor`.
 - Filter each market object:
 - Must have `enableOrderBook == Some(true)` (JSON key `"enableOrderBook"`).
 - Must have `closed != Some(true)` and `active == Some(true)`.
 
-- Extract `"clobTokenIds"`:
-- **CRITICAL QUIRK:** Gamma API sometimes returns `"clobTokenIds": ["123...", "456..."]` as a JSON array AND sometimes as a JSON-encoded string `"clobTokenIds": "[\"123...\", \"456...\"]"`. Implement a custom `serde` deserializer that accepts both `Vec<String>` and `String` (parsing the inner string via `serde_json::from_str::<Vec<String>>`).
+- Extract the outcome identifiers. There are **two wire shapes**:
+  - **V2 markets** (`"version": "v2"`) carry `"positionIds"` as a JSON array.
+  - **Legacy CTF markets** carry `"clobTokenIds"`.
+  - **CRITICAL QUIRK:** `clobTokenIds` itself is sometimes a JSON array `["123...", "456..."]` and sometimes a JSON-encoded string `"[\"123...\", \"456...\"]"`. The custom `serde` deserializer must accept both `Vec<String>` and `String` (parsing the inner string via `serde_json::from_str::<Vec<String>>`), and `positionIds` must be preferred when present. Reading only `clobTokenIds` silently drops every V2 market.
 
 - Emit all non-empty token IDs (both YES and NO outcome tokens) deduplicated via `HashSet`.
 
@@ -448,7 +453,13 @@ After the rate-based rule and a 5 s silence gate, the same soak produced **4,728
 
 A caveat on reading the failover count: a subset are *first-hydration arbitration*, not churn. Whichever connection delivers a symbol's snapshot first becomes active, and that is logged as a failover; it happens at most once per symbol. The 200-symbol smoke settled at exactly 100 switches with 200 snapshots (one per pair), while the 10,000-symbol soak sits below one switch per symbol.
 
-**Not exercised:** full scale. The venue reports at least 139,604 tokens, which at 500/socket implies ~280 shards and ~560 sockets with redundancy — roughly 14× this soak. That remains the open risk, together with the ~10-minute discovery walk.
+**Not exercised:** full scale. The venue reports at least 209,604 tokens and was still counting, which at 5,000/socket implies ~42 shards and ~84 sockets with redundancy. That remains the open risk, together with the ten-minute-plus discovery walk.
+
+### 4.13 Time-to-First-Byte (Phase 9, post-soak)
+
+The complete-venue soak never reached streaming: discovery was still at 1,050 pages / 209,604 symbols when its eight-minute budget expired. Waiting for a full walk before subscribing therefore produces a collector that is silent for ten-plus minutes, which is unacceptable for a data collector.
+
+`--startup-tokens` bounds the *initial* fetch only (default `0` = all). It exists for the slow Gamma fallback; with CLOB discovery a full fetch takes ~5 s, so the default no longer caps coverage. The reconciler still adds anything new on its next pass, and `--max-tokens` bounds the whole run for smoke tests.
 
 ---
 
@@ -497,6 +508,7 @@ Options:
       --snapshot-interval-secs <N> Periodic full snapshot interval [default: 60]
       --rotate-minutes <N>         Base TTL for make-before-break socket cycling [default: 35]
       --max-tokens <N>             Optional cap on total tokens (useful for quick smoke tests)
+      --startup-tokens <N>         Symbols to subscribe before first output (0 = all) [default: 0]
       --benchmark-latency          Run empirical latency experiments instead of collector
   -h, --help                       Print help
 
@@ -506,7 +518,7 @@ Options are introduced by the phase that implements them, so the binary never ad
 
 **At production scale, set `--poll-interval-secs 900` or more.** A poll walks the venue's entire keyset chain, which is sequential by construction: 700 pages (~70,000 markets) took eight minutes and had counted **139,604 tokens without finishing**. Anything shorter means the reconciler runs continuously. The 30s default is only appropriate for small or capped runs.
 
-`--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
+`--tokens-per-socket` defaults to **500**, and going much higher is unsafe: at 1,000+ the venue accepts the subscription frame but silently serves only a handful of assets (measured: 1,000/socket → 2 of 2,000 books hydrated; 5,000/socket → 188 of 17,438). 500 has hydrated 100% in every run, and 750 also worked. The live universe is ~17.5k tokens (the CLOB index), so 500/socket with redundancy 2 is ~70 sockets.
 
 ### Graceful `SIGINT` / `SIGTERM` Shutdown Sequence
 

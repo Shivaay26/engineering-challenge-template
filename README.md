@@ -40,6 +40,7 @@ to `stderr`, so `collector | your_reader` is safe.
     --poll-interval-secs <N>     REST discovery interval [default: 30]
     --snapshot-interval-secs <N> Periodic full snapshot interval [default: 60]
     --max-tokens <N>             Cap total symbols (smoke tests only)
+    --startup-tokens <N>         Symbols before first output (0 = all) [default: 0]
     --benchmark-latency          Run latency experiments instead of collecting
 ```
 
@@ -136,8 +137,11 @@ result for socket tuning on this network, are in
 ## Known limitations
 
 - **Failover and watchdog thresholds were tuned on measured churn**, not on the numbers in the original outline: the failover lag is 2 s (not 150 ms) and `Active` means ≥30 messages per five minutes. A 10,000-symbol soak showed the original values produced ~31,800 failovers in three minutes.
-- **Full-scale soak is the open item.** Verification so far: 40 symbols (failover), 100 symbols (two rotations promoted at 100% hydration), 1,000 symbols across 2 sockets, and a 10,000-symbol / 40-socket run. The venue reports **at least 139,604 tokens** (a lower bound; the walk was still counting when stopped), which at 500/socket implies ~280 shards and ~560 sockets with redundancy — a scale that has not been exercised end to end.
-- **Discovery takes ten minutes or more.** The keyset cursor chain is sequential (~0.7 s per 100-market page), so startup time to first byte is long at full scale. This is a venue constraint; `liquidity_num_min` / `volume_num_min` filters are the practical mitigation and are not applied by default.
+- **`--tokens-per-socket` above ~750 silently loses coverage.** The venue accepts an oversized subscription and serves only a handful of assets with no error (1,000/socket → 2 of 2,000 hydrated). 500 is the default and has hydrated 100% in every run. The collector warns if fewer than half the requested symbols produce data.
+- **Discovery uses the CLOB's own market index** (`clob.polymarket.com/sampling-simplified-markets`), with Gamma's keyset endpoint only as a fallback. Measured: **8,749 live markets / ~17.5k tokens in ~5 s** via CLOB versus **>8 minutes** via Gamma. `--poll-interval-secs` therefore does not need to exceed a ten-minute walk.
+- **Verified coverage**: the complete live universe (17,438 symbols) across 35 shards / 70 sockets, 0 dropped frames, clean SIGINT.
+- **Gamma's 209,604-token figure overstates the live universe.** That walk counts every open candidate and player-prop market, including thousands that never trade. The CLOB's active index reports what is actually accepting orders.
+- **Gamma has two outcome-identifier shapes.** V2 markets expose `positionIds` (array); legacy markets expose `clobTokenIds` (array or JSON-encoded string). Both are handled; reading only the latter silently drops every V2 market.
 - **`--max-tokens` is a debugging aid**, not a production setting.
 - **Kalshi cannot be run** in this build (no request signing).
 - Timestamps come from the system clock; a drifting host clock skews latency

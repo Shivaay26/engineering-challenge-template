@@ -55,8 +55,11 @@ struct Cli {
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Symbols subscribed per WebSocket connection. Scale this, not the socket
-    /// count: the collector derives shards from it.
+    /// Symbols subscribed per WebSocket connection.
+    ///
+    /// 500 is the validated ceiling: at 1,000+ the venue **accepts the frame but
+    /// silently serves only a handful of assets**, with no error. Higher values
+    /// mean fewer sockets but can silently lose coverage.
     #[arg(long, default_value_t = 500)]
     tokens_per_socket: usize,
 
@@ -90,6 +93,11 @@ struct Cli {
     /// Optional cap on total symbols, for smoke tests only.
     #[arg(long)]
     max_tokens: Option<usize>,
+
+    /// Optional cap on symbols fetched before streaming starts. `0` means all.
+    /// Only useful for the slow Gamma fallback; CLOB discovery is ~5 s.
+    #[arg(long, default_value_t = 0)]
+    startup_tokens: usize,
 
     /// Run empirical latency experiments instead of the collector.
     #[arg(long)]
@@ -142,8 +150,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let signal = wait_for_shutdown_signal();
     tokio::pin!(signal);
 
+    let initial_cap = cli.max_tokens.or(if cli.startup_tokens == 0 {
+        None
+    } else {
+        Some(cli.startup_tokens)
+    });
     let symbols = tokio::select! {
-        result = discover_with_retry(&client, codec.as_ref(), cli.max_tokens, DISCOVERY_ATTEMPTS) => {
+        result = discover_with_retry(&client, codec.as_ref(), initial_cap, DISCOVERY_ATTEMPTS) => {
             result.context("initial market discovery failed")?
         }
         _ = &mut signal => {
@@ -152,13 +165,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     };
     anyhow::ensure!(!symbols.is_empty(), "no tradable symbols found");
+    let expected_symbols = symbols.len();
 
     match cli.max_tokens {
         Some(max) => eprintln!(
             "discovered {} symbols (capped by --max-tokens {max})",
             symbols.len()
         ),
-        None => eprintln!("discovered {} symbols", symbols.len()),
+        None => eprintln!(
+            "starting with {} symbols (--startup-tokens {}); the reconciler adds the rest within one poll",
+            symbols.len(),
+            cli.startup_tokens
+        ),
     }
 
     let writer = build_writer(cli.output.as_deref())?;
@@ -227,6 +245,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     watchdog.tick().await;
 
+    let mut hydration_checked = false;
+    let mut watchdog_ticks = 0u32;
+
     loop {
         tokio::select! {
             biased;
@@ -248,7 +269,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
             _ = snapshots.tick() => consumer.write_periodic_snapshots(Utc::now())?,
 
-            _ = watchdog.tick() => consumer.run_watchdog(std::time::Instant::now()),
+            _ = watchdog.tick() => {
+                consumer.run_watchdog(std::time::Instant::now());
+                watchdog_ticks += 1;
+
+                // The venue accepts oversized subscriptions and silently serves
+                // only a few assets, so compare hydration against expectations
+                // once, a minute in.
+                if !hydration_checked && watchdog_ticks >= 6 {
+                    hydration_checked = true;
+                    let hydrated = consumer.tracked_symbols();
+                    if hydrated.saturating_mul(2) < expected_symbols {
+                        eprintln!(
+                            "warning: only {hydrated} of {expected_symbols} symbols produced data; \
+                             the venue silently caps oversized subscriptions, so try \
+                             --tokens-per-socket 500"
+                        );
+                    }
+                }
+            }
         }
     }
 
