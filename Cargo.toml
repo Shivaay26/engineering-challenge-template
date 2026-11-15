@@ -6,10 +6,24 @@ build = "src/util/build.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
 crossbeam = "0.8.4"
+futures-util = "0.3"
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
 tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+
+[lints.cargo]
+# The async/networking crates above are staged in Phase 1 and wired up in
+# Phases 2-8 (see SPEC.md). Remove this allow once they are all in use.
+unused_dependencies = "allow"
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"

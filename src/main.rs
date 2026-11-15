@@ -60,7 +60,8 @@ fn main() -> anyhow::Result<()> {
     assert_eq!(PriceLevelUpdateDomain::try_from_decoder(decoded)?, update);
     assert!(reader.read_msg()?.is_none());
 
-    println!("Verification success!");
+    // Status output goes to stderr, so stdout stays reserved for SBE bytes.
+    eprintln!("Verification success!");
 
     Ok(())
 }
