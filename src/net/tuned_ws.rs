@@ -168,8 +168,11 @@ async fn dial_one(address: &SocketAddr, cfg: &NetConfig) -> anyhow::Result<TcpSt
         Some(Protocol::TCP),
     )?;
     socket.set_nonblocking(true)?;
-    socket.set_tcp_nodelay(true)?;
-    socket.set_recv_buffer_size(cfg.recv_buffer_bytes)?;
+
+    if cfg.tuned {
+        socket.set_tcp_nodelay(true)?;
+        socket.set_recv_buffer_size(cfg.recv_buffer_bytes)?;
+    }
 
     if let Some(port) = cfg.bind_port_hint {
         let local = match address {
@@ -184,7 +187,7 @@ async fn dial_one(address: &SocketAddr, cfg: &NetConfig) -> anyhow::Result<TcpSt
         .await?;
 
     #[cfg(target_os = "linux")]
-    if cfg.quickack {
+    if cfg.tuned && cfg.quickack {
         set_quickack(&stream);
     }
 
@@ -213,9 +216,14 @@ fn set_quickack(stream: &TcpStream) {
 
 /// Sends `PROBES` PINGs and records each round-trip time.
 async fn probe(socket: &mut WsSocket) -> anyhow::Result<Vec<Duration>> {
-    let mut rtts = Vec::with_capacity(PROBES);
+    probe_rtts(socket, PROBES).await
+}
 
-    for _ in 0..PROBES {
+/// Sends `probes` PINGs and records each round-trip time.
+pub async fn probe_rtts(socket: &mut WsSocket, probes: usize) -> anyhow::Result<Vec<Duration>> {
+    let mut rtts = Vec::with_capacity(probes);
+
+    for _ in 0..probes {
         let started = time::Instant::now();
         socket.send(Message::Ping(Vec::new().into())).await?;
 
@@ -241,7 +249,7 @@ async fn probe(socket: &mut WsSocket) -> anyhow::Result<Vec<Duration>> {
 
 /// Nearest-rank percentile over a sorted slice, using integer arithmetic.
 /// Ranks are ceiling-based, so p99 of a small sample is the maximum.
-fn percentile(sorted: &[Duration], numerator: usize, denominator: usize) -> Duration {
+pub fn percentile(sorted: &[Duration], numerator: usize, denominator: usize) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
     }

@@ -100,19 +100,100 @@ Consequence: at 500 tokens/socket, ~79k tokens implies roughly **143 sockets**,
 versus ~526 at the original 150/socket assumption. That is why the default was
 raised to 500.
 
-## 4. Benchmark suite — [PENDING]
+## 4. Empirical results — [MEASURED]
 
-`--benchmark-latency` (Phase 8) will run four experiments against live
-Polymarket and print Markdown tables:
+`--benchmark-latency` runs four experiments and prints Markdown tables to
+stdout. Results below are from a **mobile-hotspot connection to WSL2**, which is
+the honest label for everything in this section: absolute values are dominated
+by the cellular path, so read the *shape* and the *deltas*, not the absolute
+milliseconds.
 
-| Experiment | Question | Metric |
+### Experiment A — connection racing variance
+
+12 sockets requested, 6–8 survived the network resets, 30 PING probes each.
+
+| Metric | min | median | max | spread |
+| --- | --- | --- | --- | --- |
+| socket p50 | 332.1 ms | 338.0 ms | 344.0 ms | **11.9 ms** |
+| socket p99 | 343.4 ms | 348.0 ms | 353.7 ms | **10.3 ms** |
+
+Across three runs the p50 spread was 6.2 ms, 18.8 ms and 11.9 ms. So the Edge
+Lottery is real but modest at the median: a few milliseconds, not tens. The p99
+spread was as high as 480 ms on one run, which is the argument for tie-breaking
+on p99 rather than trusting p50 alone.
+
+### Experiment B — TCP socket tuning — **no benefit detected**
+
+Both arms sample the same 50 symbols over the same wall-clock window. Sequential
+arms were tried first and rejected: they produced 168 vs 2,162 samples because
+the link shifted between arms, which would have manufactured a fake 3x win.
+
+| Configuration | samples | p50 | p95 | p99 | p99.9 |
+| --- | --- | --- | --- | --- | --- |
+| default OS | 174 | 99.7 ms | 675.8 ms | 787.7 ms | 787.7 ms |
+| `TCP_NODELAY` + 2 MiB `RCVBUF` + `QUICKACK` | 154 | 112.7 ms | 673.0 ms | 805.0 ms | 805.0 ms |
+
+**Conclusion: no effect measurable in this environment.** The tuned arm is
+marginally worse, which is noise at these sample counts. The plausible reasons:
+
+- WSL2 NAT terminates the guest-side socket; the host and cellular stack decide
+  the behaviour we actually observe.
+- `QUICKACK` matters at sub-millisecond scale. Against a ~330 ms RTT the delayed
+  ACK timer is invisible.
+- `NODELAY` only helps many small writes; our write rate is a 10 s `PING`.
+
+This is worth keeping in the code — it costs nothing and should help on a
+low-RTT, bare-metal host — but the claim "tuning makes it faster" is **not
+supported by these measurements** and is not made here.
+
+### Experiment C — shard density sweep
+
+| symbols/socket | time to last snapshot | delta p50 | delta p99 | samples |
+| --- | --- | --- | --- | --- |
+| 25 | 932.8 ms | 163.9 ms | 277.3 ms | 1,190 |
+| 100 | 1,292.0 ms | 53.7 ms | 1,041.0 ms | 932 |
+| 250 | 1,923.8 ms | 165.0 ms | 1,004.7 ms | 964 |
+| 500 | 2,206.2 ms | 77.7 ms | 1,609.1 ms | 1,470 |
+
+Time-to-last-snapshot grows close to linearly with density (933 ms at 25 →
+2,206 ms at 500). Per-symbol delta latency does **not** show a clean trend: p50
+is non-monotonic and p99 is noisy, so this run does not support a claim that
+higher density costs per-message latency. What it does establish is warm-up
+cost: at 500/socket a shard needs ~2.2 s before every symbol is hydrated, which
+is the number the rotation warm-up budget (5 s) was chosen against.
+
+### Experiment D — parser and runtime overhead
+
+| Workload | ns/frame | frames/sec |
 | --- | --- | --- |
-| A — Connection racing variance | How much RTT spread is there across 12 parallel sockets? | min / median / max of each socket's p50 and p99 |
-| B — Socket tuning | Does tuned TCP beat defaults? | one-way `received_at − exchange_timestamp`, p50/p95/p99/p99.9 over ~2,000 deltas |
-| C — Shard density sweep | 25 vs 100 vs 250 vs 500 tokens per socket | time-to-last-snapshot on subscribe, p99 delta latency |
-| D — Parser overhead | How much of the wire-to-decision path is ours? | ns/frame for `serde_json` + `parse_scaled_1e6` on captured payloads |
+| `book` frame, 50 levels/side | 64,000–67,600 | ~15,000 |
+| `price_change` frame, 5 changes | 6,300–14,500 | ~69,000–158,000 |
+| `parse_scaled_1e6("0.4812")` | 22–31 ns | ~32–45M |
 
-## 5. Environment caveats for measurement
+At 71k symbols with per-symbol update rates well under 1/s, decoding is not the
+bottleneck: even 15k book frames/sec is far above what the feed delivers.
+
+## 5. Decoder: the double-parse tax — [MEASURED]
+
+The Polymarket frame decoder originally used `#[serde(untagged)] enum RawWsFrame
+{ Batch(Vec<Value>), Single(Value) }`. Serde tries untagged variants **in
+order**, so every single-object frame was parsed twice: first as `Vec<Value>`
+(failing), then again as `Value`.
+
+Measured cost and result of dispatching on the first non-whitespace byte
+instead:
+
+| Frame | before | after | change |
+| --- | --- | --- | --- |
+| `book`, 50 levels/side | 115 µs | 64–68 µs | **~43% faster** |
+| `price_change`, 5 changes | 11.7 µs | 6.3–14.5 µs | ~45% faster best case, noisy |
+
+This is the one latency result with a clear causal attribution: same payloads,
+same machine, same measurement harness, one duplicate parse removed. It also
+applies to *every* frame the collector ever handles, whereas the socket tuning
+above is unproven here.
+
+## 6. Environment caveats for measurement
 
 - The development host is WSL2 behind NAT; socket options apply guest-side only.
 - The mobile-hotspot path used during development **resets roughly 80% of new TLS

@@ -404,6 +404,16 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 5. **Per-connection source-port binding is plumbed but off by default.** The kernel already assigns distinct ephemeral ports for Conn A and Conn B; the hook exists for hosts where RSS hashing collapses them.
 6. **`LATENCY_DISCOVERIES.md` is maintained from Phase 7 onward,** not written at the end: each technique is recorded with its rationale, its cost, and an explicit `[IMPLEMENTED]`/`[MEASURED]`/`[PENDING]` marker so unmeasured claims cannot be mistaken for results.
 
+### 4.10 Implementation Decisions (Phase 8)
+
+1. **`--benchmark-latency` writes Markdown to `stdout`.** This is the one documented exception to "stdout is SBE only": the report is meant to be pasted into `LATENCY_DISCOVERIES.md`. Progress and errors still go to `stderr`, and the mode is selected before the collector starts, so the two outputs never mix.
+2. **Experiment A disables racing** (`race_candidates: 1`) and measures 12 independent sockets × 30 probes, reporting min/median/max of each socket's p50 and p99 plus the spread. Racing would hide the very variance being measured.
+3. **Experiment B runs both arms simultaneously.** Running them sequentially measured the network, not the socket options: one sequential run produced 168 samples for the default arm and 2162 for the tuned arm, because the link changed between arms. Both feeds now sample the same symbols over the same wall-clock window, so the comparison is at least stationary.
+4. **Experiment C sweeps 25 / 100 / 250 / 500 symbols per socket on one connection each**, reporting time-to-last-snapshot and delta p50/p99 rather than a single blended number, because the two effects trade off.
+5. **Experiment D is synthetic but representative** (a 50-level `book`, a 5-change `price_change`, and 1M `parse_scaled_1e6` calls) with `black_box`, so the figures are reproducible offline and not dependent on the network.
+6. **The suite is bounded**: 20s warm-up cap per feed and a 12s sampling window, so the whole run finishes in about three minutes rather than the 30–60s per experiment the original outline implied.
+7. **Frame dispatch replaced the `#[serde(untagged)]` enum.** Serde tries untagged variants in order, so every single-object frame was parsed twice — once failing as `Vec<Value>`, then again as `Value`. Experiment D measured **115 µs → 64 µs** for a 100-level `book` frame and **11.7 µs → 6.3 µs** for a 5-change `price_change` after switching to a first-byte dispatch (both wire shapes are still covered by unit tests).
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -456,7 +466,7 @@ Options:
 
 ```
 
-Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; Phase 7 adds `--race-connections`; `--benchmark-latency` follows in Phase 8.
+Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; Phase 7 adds `--race-connections`; Phase 8 adds `--benchmark-latency`.
 
 `--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
 

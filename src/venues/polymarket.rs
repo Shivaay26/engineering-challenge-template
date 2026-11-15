@@ -78,14 +78,6 @@ where
     }
 }
 
-/// A single text frame from the CLOB socket: either one object or a batch.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawWsFrame {
-    Batch(Vec<Value>),
-    Single(Value),
-}
-
 /// Returns the tradable symbols of `markets`, in first-seen order.
 fn active_symbols(markets: impl IntoIterator<Item = GammaMarket>) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -341,17 +333,21 @@ impl VenueCodec for PolymarketCodec {
             return Ok(Vec::new());
         }
 
-        match serde_json::from_str::<RawWsFrame>(raw)
-            .context("decoding Polymarket WebSocket frame")?
-        {
-            RawWsFrame::Single(value) => decode_value(&value, received_at),
-            RawWsFrame::Batch(values) => {
-                let mut events = Vec::new();
-                for value in &values {
-                    events.extend(decode_value(value, received_at)?);
-                }
-                Ok(events)
+        // Dispatch on the first byte instead of using `#[serde(untagged)]`.
+        // An untagged enum tries each variant in order, so a single-object frame
+        // was parsed twice: once failing as `Vec<Value>`, then again as `Value`.
+        // Experiment D measured that at ~115us for a 100-level book frame.
+        if raw.starts_with('[') {
+            let values: Vec<Value> =
+                serde_json::from_str(raw).context("decoding Polymarket batch frame")?;
+            let mut events = Vec::new();
+            for value in &values {
+                events.extend(decode_value(value, received_at)?);
             }
+            Ok(events)
+        } else {
+            let value: Value = serde_json::from_str(raw).context("decoding Polymarket frame")?;
+            decode_value(&value, received_at)
         }
     }
 }

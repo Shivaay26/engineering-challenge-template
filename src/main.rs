@@ -82,6 +82,10 @@ struct Cli {
     /// Optional cap on total symbols, for smoke tests only.
     #[arg(long)]
     max_tokens: Option<usize>,
+
+    /// Run empirical latency experiments instead of the collector.
+    #[arg(long)]
+    benchmark_latency: bool,
 }
 
 #[tokio::main]
@@ -99,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
         .context("building the HTTP client")?;
 
     eprintln!("discovering {} markets over REST", codec.name());
+    if cli.benchmark_latency {
+        return engineering_challenge::bench::run(&client, codec.as_ref()).await;
+    }
+
     let symbols = discover_with_retry(&client, codec.as_ref(), cli.max_tokens, DISCOVERY_ATTEMPTS)
         .await
         .context("initial market discovery failed")?;
