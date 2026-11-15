@@ -256,6 +256,7 @@ impl VenueCodec for PolymarketCodec {
         let mut seen = HashSet::new();
         let mut symbols = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
 
         loop {
             let mut request = client.get(GAMMA_MARKETS_URL).query(&[
@@ -279,6 +280,14 @@ impl VenueCodec for PolymarketCodec {
 
             if page.markets.is_empty() {
                 break;
+            }
+
+            pages += 1;
+            if pages.is_multiple_of(50) {
+                eprintln!(
+                    "discovery: {pages} pages scanned, {} symbol(s) so far",
+                    symbols.len()
+                );
             }
 
             for symbol in active_symbols(page.markets) {

@@ -40,6 +40,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 32_768;
 const DISCOVERY_ATTEMPTS: u32 = 8;
 /// How often the consumer classifies symbol activity and checks for zombies.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+/// How long workers get to close their sockets before they are aborted.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -135,9 +137,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return engineering_challenge::bench::run(&client, codec.as_ref()).await;
     }
 
-    let symbols = discover_with_retry(&client, codec.as_ref(), cli.max_tokens, DISCOVERY_ATTEMPTS)
-        .await
-        .context("initial market discovery failed")?;
+    // Bind the signal before discovery: at full scale the keyset walk takes
+    // minutes, and Ctrl-C during it must not be ignored.
+    let signal = wait_for_shutdown_signal();
+    tokio::pin!(signal);
+
+    let symbols = tokio::select! {
+        result = discover_with_retry(&client, codec.as_ref(), cli.max_tokens, DISCOVERY_ATTEMPTS) => {
+            result.context("initial market discovery failed")?
+        }
+        _ = &mut signal => {
+            eprintln!("shutdown requested during discovery");
+            return Ok(());
+        }
+    };
     anyhow::ensure!(!symbols.is_empty(), "no tradable symbols found");
 
     match cli.max_tokens {
@@ -210,9 +223,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // interval from now rather than duplicating the initial snapshots.
     snapshots.tick().await;
 
-    let signal = wait_for_shutdown_signal();
-    tokio::pin!(signal);
-
     let mut watchdog = time::interval(WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     watchdog.tick().await;
@@ -248,23 +258,42 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     poller.abort();
     let _ = poller.await;
 
-    let mut channel_open = true;
-    loop {
-        tokio::select! {
-            biased;
+    // Drain in-flight events while workers close, but never block shutdown
+    // forever: a worker stuck in an unresponsive TLS handshake would otherwise
+    // keep the process alive indefinitely.
+    let graceful = async {
+        let mut channel_open = true;
+        loop {
+            tokio::select! {
+                biased;
 
-            message = events_rx.recv(), if channel_open => {
-                match message {
-                    Some(message) => consumer.apply(message)?,
-                    None => channel_open = false,
+                message = events_rx.recv(), if channel_open => {
+                    match message {
+                        Some(message) => consumer.apply(message)?,
+                        None => channel_open = false,
+                    }
                 }
-            }
 
-            joined = workers.join_next(), if !workers.is_empty() => {
-                let _ = joined;
-            }
+                joined = workers.join_next(), if !workers.is_empty() => {
+                    let _ = joined;
+                }
 
-            else => break,
+                else => break,
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    };
+
+    if time::timeout(SHUTDOWN_GRACE, graceful).await.is_err() {
+        eprintln!(
+            "{} websocket(s) did not stop within {SHUTDOWN_GRACE:?}; aborting them",
+            workers.len()
+        );
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        while let Some(message) = events_rx.recv().await {
+            consumer.apply(message)?;
         }
     }
 

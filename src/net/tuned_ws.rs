@@ -137,6 +137,10 @@ pub async fn connect(
     Ok((winner, Some(outcome)))
 }
 
+/// Bounds one dial + handshake. Without this, an unresponsive edge can leave a
+/// worker stuck inside `connect_async` forever — which also blocks shutdown.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Opens one TCP connection with the tuned options and completes the WebSocket
 /// handshake. Addresses are tried in order, which matters on hosts that publish
 /// both A and AAAA records but can only route one family.
@@ -148,13 +152,19 @@ async fn dial(
     let mut last_error = None;
 
     for address in addresses {
-        match dial_one(address, cfg).await {
-            Ok(stream) => {
-                let (socket, _response) =
-                    client_async_tls_with_config(request.clone(), stream, None, None).await?;
-                return Ok(socket);
+        let attempt = async {
+            let stream = dial_one(address, cfg).await?;
+            let (socket, _response) =
+                client_async_tls_with_config(request.clone(), stream, None, None).await?;
+            Ok::<WsSocket, anyhow::Error>(socket)
+        };
+
+        match time::timeout(CONNECT_TIMEOUT, attempt).await {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!("connecting to {address} timed out"));
             }
-            Err(error) => last_error = Some(error),
         }
     }
 
