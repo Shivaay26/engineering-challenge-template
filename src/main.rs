@@ -320,7 +320,7 @@ async fn reconcile_symbols(
             }
 
             _ = ticker.tick() => {
-                match codec.fetch_active_symbols(&client, None).await {
+                match codec.fetch_active_symbols(&client, manager.max_symbols()).await {
                     Ok(latest) => {
                         let latest: HashSet<String> = latest.into_iter().collect();
 

@@ -166,6 +166,11 @@ impl ShardManager {
         self.inner.lock().map(|inner| inner.total()).unwrap_or(0)
     }
 
+    /// The configured symbol cap, so the reconciler can bound its own scan.
+    pub fn max_symbols(&self) -> Option<usize> {
+        self.inner.lock().ok().and_then(|inner| inner.max_symbols)
+    }
+
     /// Subscribes to new symbols on every connection of their shard.
     pub async fn add(&self, symbols: &[String]) {
         let batches = {
