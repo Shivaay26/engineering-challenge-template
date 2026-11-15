@@ -89,16 +89,30 @@ to keep hot.
 
 Measurements from live discovery and a live subscription run:
 
-- Gamma's keyset walk reached **39,500 active markets / 78,804 tokens** before
-  the walk was cut off by its own time limit, so those are **lower bounds**.
+- A keyset walk on WiFi scanned **700 pages (~70,000 markets) in eight minutes and
+  was still climbing**, having counted **139,604 unique tokens**. Every figure
+  here is a lower bound: the walk was stopped, not finished. The cursor chain is
+  sequential (the next page requires the previous page's cursor), so it cannot be
+  parallelised, and a page costs roughly 0.7 s.
 - Each market contributes two outcome tokens, hence tokens ≈ 2 × markets.
 - A 1,000-symbol run with `--tokens-per-socket 500` subscribed **500 assets on a
   single connection without error**, and all 1,000 symbols hydrated across two
   sockets (4,004 snapshots, 15,588 deltas, 66,569 resting levels).
 
-Consequence: at 500 tokens/socket, ~79k tokens implies roughly **143 sockets**,
-versus ~526 at the original 150/socket assumption. That is why the default was
-raised to 500.
+Consequences:
+
+- At 500 tokens/socket, ~140k tokens implies **~280 shards**, or **~560 sockets**
+  with redundancy 2. At the original 150/socket it would have been ~930 sockets.
+  This is the real scale of the base challenge, and it is the strongest argument
+  for both high density and a liquidity filter (see below).
+- Full discovery takes **ten minutes or more**, which is why
+  `--poll-interval-secs` must be well above the walk duration (900 s or more). A
+  30 s or 300 s poll interval would mean the reconciler never pauses between
+  walks.
+- Gamma's keyset endpoint supports `liquidity_num_min` / `volume_num_min`. Those
+  filters are the practical way to cut a 140k-token universe down to the markets
+  that actually trade; the collector does not apply them today, because the
+  challenge asks for all live symbols.
 
 ## 4. Empirical results — [MEASURED]
 
@@ -193,7 +207,40 @@ same machine, same measurement harness, one duplicate parse removed. It also
 applies to *every* frame the collector ever handles, whereas the socket tuning
 above is unproven here.
 
-## 6. Environment caveats for measurement
+## 6. Soak findings — [MEASURED]
+
+A 10,000-symbol run (20 shards × 2 connections, rotation enabled, three minutes)
+produced 37 successful rotations, zero dropped frames and a clean SIGINT, but
+also **31,844 failovers and 7,115 watchdog resubscribes**.
+
+That is the most useful result in this file, because it is a defect that small
+runs hid: every failover writes a resync snapshot, so the capture was dominated
+by them and the delta stream was degraded. Two thresholds were wrong:
+
+| Knob | Was | Now | Why |
+| --- | --- | --- | --- |
+| Failover lag | 150 ms | **2 s** | At scale the two feeds are routinely >150 ms out of phase on low-rate symbols; that is propagation, not a stall. The pair oscillated, switching on every late arrival. |
+| Missed updates | 2 | **10** | With 2, the 2 s gap alone still fired ~18,800 times: most markets update minutes apart, so one in-flight message already looks like a long gap. |
+| Failover dwell | none | **30 s** | Stops the pair alternating on every subsequent message after a switch. |
+| `Active` tier | ≥6 msgs / 5 min | **≥30** | One update per 50 s classified most of the venue as active, so ~7,100 symbols were "zombies". |
+| Zombie silence | 30 s | **60 s** | Matched to the stricter tier, so a quiet market is not churned. |
+
+The lesson generalises: thresholds that look reasonable on 40 symbols are
+dominated by low-rate symbols at 10,000, because most of the venue updates on the
+order of a minute, not a second.
+
+Progression, all on the same 10,000-symbol / 40-socket soak:
+
+| Pass | Failovers | Watchdog resubscribes |
+| --- | --- | --- |
+| 150 ms lag, ≥2 missed, ≥6 msgs/5 min | 31,844 | 7,115 |
+| 2 s lag, ≥30 msgs/5 min, 60 s silence | 18,804 | 287 |
+| + ≥10 missed updates and a 30 s dwell | **5,979** | **244** |
+
+Zero dropped frames and a clean SIGINT in every pass, so the improvement is in
+arbitration quality rather than in throughput.
+
+## 7. Environment caveats for measurement
 
 - The development host is WSL2 behind NAT; socket options apply guest-side only.
 - The mobile-hotspot path used during development **resets roughly 80% of new TLS

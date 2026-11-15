@@ -414,6 +414,40 @@ Verified against live Polymarket over a mobile hotspot (the campus network block
 6. **The suite is bounded**: 20s warm-up cap per feed and a 12s sampling window, so the whole run finishes in about three minutes rather than the 30–60s per experiment the original outline implied.
 7. **Frame dispatch replaced the `#[serde(untagged)]` enum.** Serde tries untagged variants in order, so every single-object frame was parsed twice — once failing as `Vec<Value>`, then again as `Value`. Experiment D measured **115 µs → 64 µs** for a 100-level `book` frame and **11.7 µs → 6.3 µs** for a 5-change `price_change` after switching to a first-byte dispatch (both wire shapes are still covered by unit tests).
 
+### 4.11 Implementation Decisions (Phase 9)
+
+1. **A closed downstream is a normal exit.** `collector | head` used to surface a write error and exit `1`. `main` now inspects the error chain for `ErrorKind::BrokenPipe` and exits `0` with a one-line note, because a streaming process being closed by its reader is not a failure.
+2. **The reconciler honours `--max-tokens`.** It previously re-fetched with no cap, so a 40-symbol smoke test walked every market on every poll. `ShardManager` exposes its cap and the reconciler passes it, keeping the initial and reconciled sets selected the same way.
+3. **README is the operational document; SPEC is the design record.** The README carries quick start, CLI, invariants, verification status and known limitations, and links to this file for decisions rather than duplicating them.
+4. **`LATENCY_DISCOVERIES.md` states its own limits.** Environment, sample sizes, the sequential-vs-simultaneous correction, and the one measured negative result are all recorded, so no reader can mistake a cellular-network measurement for a production figure.
+
+### 4.12 Soak Findings and Threshold Tuning (Phase 9)
+
+The first real multi-shard soak (10,000 symbols, 20 shards × 2 connections, rotation enabled) exposed a defect that smaller runs could not:
+
+| Observation | Value |
+| --- | --- |
+| Sockets | 40 |
+| Rotations / promotions | 37 / 37 (all warm, none failed) |
+| Dropped frames | 0 |
+| Socket errors | 3 |
+| Peak RSS | 381 MB |
+| Capture written | 192 MB in ~3 minutes |
+| Shutdown | SIGINT honoured, final chunk flushed, no aborted workers |
+| **Failovers** | **31,844** |
+| **Watchdog resubscribes** | **7,115** |
+
+The infrastructure behaved; the *arbitration* did not. Both thresholds were calibrated on tiny runs and do not survive scale:
+
+1. **Failover lag: 150 ms → 2 s, then missed-updates 2 → 10 and a 30 s dwell.** At 10,000 symbols the two feeds are routinely more than 150 ms out of phase on low-rate symbols, because "latest exchange timestamp" differs whenever one socket has received the next update and the other has not. That is normal propagation, not a stall. Worse, it oscillated: switch to B, A's late update arrives, switch back. 150 ms gave ~31,800 switches in three minutes; raising the gap alone only got it to ~18,800, because most markets update minutes apart, so a *single* in-flight message already looks like a multi-second gap. The rule is now rate-based: the standby must have delivered 10 updates the active never showed, and a 30 s dwell prevents alternating on every subsequent message.
+2. **Activity tier: `>= 6` → `>= 30` messages per five minutes, silence `30s → 60s`.** Six messages per five minutes classified most of the venue as `Active`, so ~7,100 symbols were declared zombies and resubscribed within three minutes. A symbol that emits one update every 50 seconds is *quiet*, not broken; requiring ~one update per 10 seconds is a better definition of "should be busy".
+
+Both changes are recorded in `LATENCY_DISCOVERIES.md` with the measurements that motivated them, and the failover test now drives ten missed updates so the tuned rule is what it exercises.
+
+After the rate-based rule, the same soak produced **5,979 failovers and 244 watchdog resubscribes** — down from 31,844 and 7,115 — still with zero dropped frames and a clean shutdown. Rotation coverage in that pass was only 3 promotions because the streaming window was shorter than most rotation deadlines; the earlier pass exercised 39/39.
+
+**Not exercised:** full scale. The venue reports at least 139,604 tokens, which at 500/socket implies ~280 shards and ~560 sockets with redundancy — roughly 14× this soak. That remains the open risk, together with the ~10-minute discovery walk.
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -467,6 +501,8 @@ Options:
 ```
 
 Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 shipped `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; Phase 5 added `--redundancy`; Phase 6 adds `--rotate-minutes`; Phase 7 adds `--race-connections`; Phase 8 adds `--benchmark-latency`.
+
+**At production scale, set `--poll-interval-secs 900` or more.** A poll walks the venue's entire keyset chain, which is sequential by construction: 700 pages (~70,000 markets) took eight minutes and had counted **139,604 tokens without finishing**. Anything shorter means the reconciler runs continuously. The 30s default is only appropriate for small or capped runs.
 
 `--tokens-per-socket` defaults to **500**, not 150. Live discovery measured at least 39,500 active markets / 78,804 tokens (the walk was cut short, so this is a lower bound), which at 150/socket would mean ~526 connections. The collector derives the shard count from this value and logs the resulting socket count on startup.
 

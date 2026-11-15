@@ -1,21 +1,150 @@
-# Read before getting started!!
+# Voluntas order book collector
 
-First, read [src/main.rs](https://github.com/voluntas-io/engineering-challenge/blob/main/src/main.rs). Then, some background on this repo:
+A Rust collector for Polymarket order book data. It discovers every live market,
+maintains an order book per outcome token across sharded redundant WebSockets,
+and writes snapshots plus price-level deltas as aligned SBE to `stdout` or a
+file.
 
-This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
-for writing binary messages. The rust code abstracts this away for you, and you can simply use the helpers, as demonstrated in `main.rs`.
+Kalshi is implemented as a second `VenueCodec` to show the engine is
+venue-agnostic; see [Venues](#venues).
 
-### More background, in case you are curious!
+## Quick start
 
-FIX SBE is defined in XML, which I find extremely cumbersome to edit, especially
-when updating schemas frequently. To solve this, I have also introduced some
-helper code that takes our own custom YAML format, and turns it into FIX SBE
-XML, which in turn is used to generate rust code to encode and decode the
-messages. **You don't need to edit any of these files**. This explanation is
-simply to help you understand the origins of the various files in this repo.
+```bash
+cargo build --release
 
-If you're curious to see the YAML schema, take a look at [challenge_orderbook.yaml](https://github.com/voluntas-io/engineering-challenge/blob/main/sbe_schemas/engineering_challenge/challenge_orderbook.yaml).
-We also use a custom timestamp field, so that the Rust struct can use
-`chrono::DateTime` in the generated struct, and in SBE schema, it is a uint64
-representing the timestamp as the number of microseconds since unix epoch.
+# Stream SBE to stdout (default)
+./target/release/engineering-challenge > capture.sbe
 
+# Or write to a file
+./target/release/engineering-challenge -o capture.sbe
+
+# Smoke test: 40 symbols, two sockets
+./target/release/engineering-challenge --max-tokens 40 --tokens-per-socket 20 -o smoke.sbe
+```
+
+Stop with `Ctrl-C` (or `SIGTERM`). The collector closes its sockets, drains
+in-flight events, writes a final full snapshot chunk, and exits `0`.
+
+`stdout` carries **binary SBE only**. Every status line, counter and error goes
+to `stderr`, so `collector | your_reader` is safe.
+
+## CLI
+
+```text
+-o, --output <PATH>              Output path; omit or `-` for stdout
+    --tokens-per-socket <N>      Symbols per connection [default: 500]
+    --redundancy <N>             1 = single connection, 2 = Conn A + Conn B [default: 2]
+    --race-connections <N>       Parallel TLS+WS candidates raced per dial [default: 4]
+    --rotate-minutes <N>         Base connection lifetime; 0 disables [default: 35]
+    --poll-interval-secs <N>     REST discovery interval [default: 30]
+    --snapshot-interval-secs <N> Periodic full snapshot interval [default: 60]
+    --max-tokens <N>             Cap total symbols (smoke tests only)
+    --benchmark-latency          Run latency experiments instead of collecting
+```
+
+**Set `--poll-interval-secs 900` for a real run.** A full keyset walk takes ten
+minutes or more (700 pages and still counting at the last measurement), so a
+shorter interval means the reconciler never pauses between scans. The 30s default
+is only sensible for capped smoke tests.
+
+## Architecture
+
+```text
+Gamma REST ──> PolymarketCodec ──> ShardManager ──> socket workers (A/B per shard)
+                                                          │
+                                                          ▼
+                                             mpsc<EngineMessage>
+                                                          │
+                                                          ▼
+                                    Consumer (single owner of books + writer)
+                                                          │
+                                                          ▼
+                                              AlignedSbeWriter -> stdout/file
+```
+
+- **One consumer owns all state.** Books and the SBE writer live in a single task
+  fed by an mpsc channel. WebSocket tasks never touch book state, so a
+  half-updated book cannot be serialised.
+- **Each shard runs two isolated books per symbol** (`Primary` and `Standby`).
+  Events are tagged with slot + connection generation; retired generations are
+  dropped.
+- **Failover emits a reconciliation snapshot.** Switching slots always writes a
+  full snapshot of the newly active book before any of its deltas, because the
+  two feeds can disagree after a dropped message.
+- **Rotation is make-before-break.** The replacement connects and warms up while
+  the old socket keeps streaming; only then is the old one closed. The two
+  connections of a shard are staggered by half a lifetime.
+
+## Correctness invariants
+
+1. **No floating point on prices.** Exchange decimal strings are parsed straight
+   into `i64` scaled by `1e6` (`parse_scaled_1e6`). `"0.29"` becomes `290_000`
+   exactly; digits past the sixth decimal are truncated, never rounded.
+2. **Replay equivalence.** For a symbol, applying every emitted
+   `PriceLevelUpdateDomain` in order onto the preceding `SnapshotDomain` must
+   reproduce the next snapshot. Deltas always carry the *post-update absolute*
+   level size, so `0` means "level deleted".
+3. **Never emit deltas for an unhydrated book.** A delta is only written after a
+   snapshot established the book; otherwise a partial state would be published.
+4. **A resync is not a bug.** At a failover, rotation, or a post-reconnect venue
+   `book`, the new snapshot is authoritative and may legitimately differ from the
+   replayed state. That is why a snapshot is emitted on switch.
+
+`examples/inspect` verifies (1)–(4) against a capture:
+
+```bash
+cargo run --release --example inspect -- capture.sbe
+```
+
+It replays the file, reports snapshot/delta counts, counts **resync points**
+(expected at failovers) and fails only on structural corruption: negative sizes
+or a crossed book.
+
+## Venues
+
+| Venue | Status |
+| --- | --- |
+| Polymarket | Primary. Gamma keyset discovery + CLOB WebSocket decoding, fully implemented and tested. |
+| Kalshi | Compatibility proof for the generic codec layer. Decoding, MVE filtering and subscription framing are unit-tested; the signed handshake is intentionally not implemented, so it cannot be run without credentials. |
+
+Decoding is the only exchange-specific layer: `VenueCodec`. Everything else —
+sharding, redundancy, failover, snapshots, SBE output — is shared.
+
+## Testing
+
+```bash
+cargo test                 # 24 tests
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Coverage includes: exact `1e6` parsing and its rejection cases, Gamma
+`clobTokenIds` in both wire shapes, single/batched frame decoding, level
+insertion/modification/deletion, the SBE replay invariant over 20 deltas,
+generation filtering, failover with a reconciliation snapshot, activity-tier
+classification, and an end-to-end test that runs a local WebSocket server through
+the real worker and consumer.
+
+## Latency
+
+`--benchmark-latency` runs four experiments and prints Markdown tables (to
+stdout, so they can be pasted into a report). Findings, including a negative
+result for socket tuning on this network, are in
+[LATENCY_DISCOVERIES.md](LATENCY_DISCOVERIES.md).
+
+## Known limitations
+
+- **Failover and watchdog thresholds were tuned on measured churn**, not on the numbers in the original outline: the failover lag is 2 s (not 150 ms) and `Active` means ≥30 messages per five minutes. A 10,000-symbol soak showed the original values produced ~31,800 failovers in three minutes.
+- **Full-scale soak is the open item.** Verification so far: 40 symbols (failover), 100 symbols (two rotations promoted at 100% hydration), 1,000 symbols across 2 sockets, and a 10,000-symbol / 40-socket run. The venue reports **at least 139,604 tokens** (a lower bound; the walk was still counting when stopped), which at 500/socket implies ~280 shards and ~560 sockets with redundancy — a scale that has not been exercised end to end.
+- **Discovery takes ten minutes or more.** The keyset cursor chain is sequential (~0.7 s per 100-market page), so startup time to first byte is long at full scale. This is a venue constraint; `liquidity_num_min` / `volume_num_min` filters are the practical mitigation and are not applied by default.
+- **`--max-tokens` is a debugging aid**, not a production setting.
+- **Kalshi cannot be run** in this build (no request signing).
+- Timestamps come from the system clock; a drifting host clock skews latency
+  measurements.
+
+## Design notes
+
+The phase plan, protocol details, invariants and every implementation decision
+are recorded in [SPEC.md](SPEC.md), including the sections on failover,
+watchdog thresholds and the benchmark methodology.
