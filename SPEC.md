@@ -38,6 +38,7 @@
     ├── engine/
     │   ├── mod.rs
     │   ├── orderbook.rs            # OrderBook (BTreeMap<i64, i64>), apply_snapshot, apply_delta, to_snapshot_domain
+    │   ├── socket.rs               # Per-shard WS session: connect, subscribe, heartbeat, decode, reconnect (Phase 4)
     │   ├── shard_manager.rs        # Dynamic token-to-shard assignment, 2x redundant Conn A/B, make-before-break rotation
     │   └── consumer.rs             # Single-consumer MPSC loop, failover arbiter, activity watchdog, 60s timer, SBE writer
     └── bench.rs                    # --benchmark-latency empirical suite (Phase 8)
@@ -344,6 +345,19 @@ When `StampedEnvelope { shard_id, slot, generation, event }` arrives at the sing
 3. Atomically update `current_generation` in the consumer so `Conn_New` becomes the active `Primary`/`Standby` slot, emitting failover `SnapshotDomain`s for any active symbols whose book state differs.
 4. Send `SocketCommand::Shutdown` to `Conn_Old` (sends WebSocket `Close` frame and drops socket).
 
+### 4.5 Implementation Decisions (Phase 4)
+
+1. **`src/engine/socket.rs` is an addition to the original layout.** The connect/subscribe/heartbeat/decode/reconnect loop is separated from `main.rs` so it can be driven by a local WebSocket server in tests; `shard_manager.rs` (Phase 5) will own assignment and Conn A/B redundancy and simply drive these sessions. The URL is a parameter rather than read from the codec, which is what makes the offline end-to-end test possible.
+2. **Chunk sizes differ by sink.** Files use 64 MiB chunks (fewer, larger writes); stdout uses 1 MiB so a downstream pipe consumer sees data promptly instead of waiting for a 64 MiB block.
+3. **A delta for an unknown or unhydrated symbol is dropped, not buffered.** Applying it would build a book from partial state, and buffering would let memory grow unboundedly for symbols that never snapshot. The periodic snapshot of that symbol will hydrate it.
+4. **A malformed frame is logged and the socket stays up.** Dropping the connection would cause a full resubscribe of the shard; redundancy and the next snapshot already cover the gap. Only transport errors trigger reconnect.
+5. **Periodic snapshots use the last observed exchange timestamp** as `exchange_timestamp`, and wall-clock `received_at` as `received_at`. Using `Utc::now()` for both would claim the venue sent the snapshot now, which is untrue and pollutes latency analysis.
+6. **The writer stays on the consumer task and uses blocking `Write`.** That is what guarantees no torn books. A 1 MiB stdout chunk bounds how long a slow pipe can stall the runtime; moving writes to `spawn_blocking` would reintroduce ordering problems for no measurable gain here.
+7. **Reconnect backoff is 1s doubling to 30s, reset after a session survives 60s.** On reconnect the worker re-subscribes its *current* symbol set, so subscription changes survive transport failures.
+8. **Subscription diffs are applied with `send().await`,** so a symbol is only removed from the reconciler's `known` set once the owning worker accepted the command. A full channel delays the next poll instead of silently losing a subscription.
+9. **CLI flags land with the phase that implements them.** Phase 4 ships `--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`. `--redundancy`, `--race-connections`, `--rotate-minutes` and `--benchmark-latency` arrive in Phases 5-8, so the binary never advertises a flag it ignores.
+10. **`tests/end_to_end.rs` runs a local WebSocket server** and drives the real worker and consumer, because the development sandbox cannot reach Polymarket at all (egress is blocked). It asserts the written SBE reads back as the expected snapshot and delta, and that a malformed frame does not kill the connection.
+
 ---
 
 ## 5. Low-Latency Networking & Benchmark Suite (`src/net/` & `src/bench.rs`)
@@ -395,6 +409,8 @@ Options:
   -h, --help                       Print help
 
 ```
+
+Options are introduced by the phase that implements them, so the binary never advertises a flag it ignores. Phase 4 ships `-o/--output`, `--tokens-per-socket`, `--poll-interval-secs`, `--snapshot-interval-secs` and `--max-tokens`; `--redundancy`, `--race-connections`, `--rotate-minutes` and `--benchmark-latency` follow in Phases 5-8.
 
 ### Graceful `SIGINT` / `SIGTERM` Shutdown Sequence
 
