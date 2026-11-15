@@ -66,9 +66,9 @@ struct Cli {
 
     /// REST market discovery interval, in seconds.
     ///
-    /// Each poll walks the venue's full market list, so at production scale this
-    /// should be well above the discovery duration: 300s is the recommended
-    /// value, and it is bounded below by the 30s default.
+    /// Each poll walks the venue's full market list, which takes ten minutes or
+    /// more at production scale, so set this to 900s or higher for a real run.
+    /// The 30s default is only appropriate for capped smoke tests.
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
 
