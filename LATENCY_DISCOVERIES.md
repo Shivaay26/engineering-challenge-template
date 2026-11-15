@@ -235,10 +235,14 @@ Progression, all on the same 10,000-symbol / 40-socket soak:
 | --- | --- | --- |
 | 150 ms lag, ≥2 missed, ≥6 msgs/5 min | 31,844 | 7,115 |
 | 2 s lag, ≥30 msgs/5 min, 60 s silence | 18,804 | 287 |
-| + ≥10 missed updates and a 30 s dwell | **5,979** | **244** |
+| + ≥10 missed updates and a 30 s dwell | 5,979 | 244 |
+| + 5 s active-silence gate | **4,728** | **290** |
 
-Zero dropped frames and a clean SIGINT in every pass, so the improvement is in
-arbitration quality rather than in throughput.
+Zero dropped frames and 35/35 rotations in the final pass, so the improvement is
+in arbitration quality rather than throughput. Note that a share of any failover
+count is *first-hydration arbitration* - whichever connection snapshots a symbol
+first becomes active, once per symbol - so the 200-symbol smoke settling at
+exactly 100 switches is the floor, not churn.
 
 ## 7. Environment caveats for measurement
 

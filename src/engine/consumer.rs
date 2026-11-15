@@ -42,6 +42,10 @@ const FAILOVER_MISSED_UPDATES: u32 = 10;
 /// After a switch, ignore further lag-based switches for this long. Without a
 /// dwell the pair can alternate on every subsequent message.
 const FAILOVER_DWELL: Duration = Duration::from_secs(30);
+/// The active slot must also have delivered nothing for this long. Without it a
+/// *liquid* symbol flips constantly: ten missed messages at 10 msg/s is only one
+/// second of being behind, which is normal propagation.
+const FAILOVER_SILENCE: Duration = Duration::from_secs(5);
 
 /// Rolling window used to classify a symbol's activity tier.
 const ACTIVITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
@@ -130,6 +134,7 @@ pub struct Consumer<W: Write> {
     /// Highest generation accepted per `(shard, slot)`.
     generations: HashMap<(usize, usize), u64>,
     maintenance: Option<Arc<dyn MaintenanceSink>>,
+    failover_silence: Duration,
 }
 
 impl<W: Write> Consumer<W> {
@@ -139,7 +144,15 @@ impl<W: Write> Consumer<W> {
             symbols: HashMap::new(),
             generations: HashMap::new(),
             maintenance: None,
+            failover_silence: FAILOVER_SILENCE,
         }
+    }
+
+    /// Overrides how long the active feed must be silent before a lag-based
+    /// failover is allowed. Tests set this to zero to avoid sleeping.
+    pub fn with_failover_silence(mut self, silence: Duration) -> Self {
+        self.failover_silence = silence;
+        self
     }
 
     /// Installs the sink used to act on watchdog decisions.
@@ -221,7 +234,13 @@ impl<W: Write> Consumer<W> {
                     state.emitted_initial = true;
                     self.writer.write_msg(&snapshot)?;
                 } else {
-                    Self::maybe_failover(&mut self.writer, &symbol, state, received_at)?;
+                    Self::maybe_failover(
+                        &mut self.writer,
+                        &symbol,
+                        state,
+                        received_at,
+                        self.failover_silence,
+                    )?;
                 }
             }
             NormalizedEvent::Delta {
@@ -257,7 +276,13 @@ impl<W: Write> Consumer<W> {
                 if index != state.active {
                     // The triggering delta is folded into the reconciliation
                     // snapshot, so it must not also be emitted.
-                    Self::maybe_failover(&mut self.writer, &symbol, state, received_at)?;
+                    Self::maybe_failover(
+                        &mut self.writer,
+                        &symbol,
+                        state,
+                        received_at,
+                        self.failover_silence,
+                    )?;
                     return Ok(());
                 }
 
@@ -295,6 +320,7 @@ impl<W: Write> Consumer<W> {
         symbol: &str,
         state: &mut SymbolState,
         now: DateTime<Utc>,
+        silence: Duration,
     ) -> anyhow::Result<()> {
         let active = state.active;
         let other = 1 - active;
@@ -305,6 +331,9 @@ impl<W: Write> Consumer<W> {
 
         let active_hydrated = state.books[active].is_hydrated();
         let lagging = state.missed >= FAILOVER_MISSED_UPDATES
+            && state.last_recv[active]
+                .map(|at| at.elapsed() >= silence)
+                .unwrap_or(true)
             && match (
                 state.last_exchange_ts[other],
                 state.last_exchange_ts[active],
@@ -571,7 +600,7 @@ mod tests {
     fn test_failover_emits_reconciliation_snapshot() -> anyhow::Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         let writer = AlignedSbeWriter::create(file.path(), CHUNK)?;
-        let mut consumer = Consumer::new(writer);
+        let mut consumer = Consumer::new(writer).with_failover_silence(std::time::Duration::ZERO);
 
         let t0 = stamp(0);
 

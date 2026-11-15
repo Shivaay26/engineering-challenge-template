@@ -444,7 +444,9 @@ The infrastructure behaved; the *arbitration* did not. Both thresholds were cali
 
 Both changes are recorded in `LATENCY_DISCOVERIES.md` with the measurements that motivated them, and the failover test now drives ten missed updates so the tuned rule is what it exercises.
 
-After the rate-based rule, the same soak produced **5,979 failovers and 244 watchdog resubscribes** — down from 31,844 and 7,115 — still with zero dropped frames and a clean shutdown. Rotation coverage in that pass was only 3 promotions because the streaming window was shorter than most rotation deadlines; the earlier pass exercised 39/39.
+After the rate-based rule and a 5 s silence gate, the same soak produced **4,728 failovers and 290 watchdog resubscribes** — down from 31,844 and 7,115 — with 35/35 rotations promoted, zero dropped frames and a clean shutdown. Rotation coverage in the earlier pass was 39/39; the counts vary with how much of the window is spent discovering versus streaming.
+
+A caveat on reading the failover count: a subset are *first-hydration arbitration*, not churn. Whichever connection delivers a symbol's snapshot first becomes active, and that is logged as a failover; it happens at most once per symbol. The 200-symbol smoke settled at exactly 100 switches with 200 snapshots (one per pair), while the 10,000-symbol soak sits below one switch per symbol.
 
 **Not exercised:** full scale. The venue reports at least 139,604 tokens, which at 500/socket implies ~280 shards and ~560 sockets with redundancy — roughly 14× this soak. That remains the open risk, together with the ~10-minute discovery walk.
 
