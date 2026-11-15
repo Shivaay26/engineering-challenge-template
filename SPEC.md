@@ -236,11 +236,16 @@ pub trait VenueCodec: Send + Sync + 'static {
 
 ### 3.4 Kalshi Adapter Proof (`src/venues/kalshi.rs`)
 
-Implement `KalshiCodec` implementing `VenueCodec` to prove Extension 3:
+Kalshi is implemented as a **compatibility proof for Extension 3**, not as the primary collector. Kalshi API keys cannot be issued in the author's region, so this codec must compile and pass its unit tests but is never exercised against the live feed. Polymarket is the venue the service is actually run against (the challenge explicitly permits this fallback).
 
-- `ws_url()` $\rightarrow$ `"wss://[external-api.kalshi.com/trade-api/ws/v2](https://external-api.kalshi.com/trade-api/ws/v2)"`
-- `fetch_active_symbols()` $\rightarrow$ filters out `mve_collection_ticker.is_some()` (non-MVE markets only).
-- `decode_text_frame()` $\rightarrow$ parses `"orderbook_snapshot"` and `"orderbook_delta"`, converting Kalshi's `yes` bids (`Side::Buy` at `price`) and `no` bids (`Side::Sell` at `1_000_000 - price`) with `is_absolute: false` (relative delta).
+Implement `KalshiCodec` implementing `VenueCodec` to prove the generic core:
+
+- `ws_url()` $\rightarrow$ `"wss://external-api-ws.kalshi.com/trade-api/ws/v2"` (`wss://api.elections.kalshi.com/trade-api/ws/v2` is also supported).
+- **Handshake authentication:** Kalshi authenticates the WebSocket upgrade itself, including for public market-data channels, so there is no anonymous connection. Send `KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP` (Unix milliseconds) and `KALSHI-ACCESS-SIGNATURE` = base64 signature over `"{timestamp}GET/trade-api/ws/v2"` (Ed25519, or RSA-PSS/SHA-256). Credentials come from `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH`; when absent, fail with a clear error rather than attempting an unauthenticated connect.
+- `fetch_active_symbols()` $\rightarrow$ cursor-paginates `GET /trade-api/v2/markets?status=open&limit=1000&cursor=...`, filtering out `mve_collection_ticker.is_some()` (non-MVE markets only).
+- `encode_initial_subscribe()` $\rightarrow$ `{"id":<n>,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":[...]}}`. `encode_subscribe()` / `encode_unsubscribe()` use `update_subscription` with `add_markets` / `delete_markets`, since a connection holds a single `orderbook_delta` subscription.
+- `decode_text_frame()` $\rightarrow$ parses `"orderbook_snapshot"` (`yes_dollars_fp` / `no_dollars_fp`: arrays of `["0.0800","300.00"]` price/size pairs) and `"orderbook_delta"` (`price_dollars`, `delta_fp`, `side`), scaling every decimal string through `parse_scaled_1e6`. Kalshi's `yes` bids map to `Side::Buy` at `price`; `no` bids map to `Side::Sell` at `1_000_000 - price`; deltas use `is_absolute: false` because `delta_fp` is a relative change.
+- `heartbeat_interval()` / `heartbeat_payload()` $\rightarrow$ `None` (no client heartbeat needed); `"market_lifecycle_v2"` frames map to `NormalizedEvent::MarketLifecycle`.
 
 ---
 
