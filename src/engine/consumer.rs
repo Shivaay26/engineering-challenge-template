@@ -19,6 +19,10 @@ use crate::{
 
 /// A standby connection must be ahead by more than this to be preferred.
 const FAILOVER_LAG_MS: i64 = 150;
+/// ...and it must have delivered at least this many updates that the active
+/// connection never showed. Time alone is ambiguous: a quiet market is silent on
+/// both feeds, so a later arrival on the standby is not evidence of lag.
+const FAILOVER_MISSED_UPDATES: u32 = 2;
 
 fn slot_index(slot: ConnSlot) -> usize {
     match slot {
@@ -47,6 +51,8 @@ struct SymbolState {
     /// A connection dropped and has not produced an event since.
     down: [bool; 2],
     emitted_initial: bool,
+    /// Events seen on the non-active slot since the active one last spoke.
+    missed: u32,
 }
 
 impl SymbolState {
@@ -59,6 +65,7 @@ impl SymbolState {
             last_recv: [None, None],
             down: [false, false],
             emitted_initial: false,
+            missed: 0,
         }
     }
 }
@@ -139,6 +146,11 @@ impl<W: Write> Consumer<W> {
 
                 state.down[index] = false;
                 state.last_recv[index] = Some(std::time::Instant::now());
+                if index == state.active {
+                    state.missed = 0;
+                } else {
+                    state.missed = state.missed.saturating_add(1);
+                }
                 state.books[index].apply_snapshot(&bids, &asks);
                 state.last_exchange_ts[index] = Some(exchange_ts);
 
@@ -166,6 +178,11 @@ impl<W: Write> Consumer<W> {
 
                 state.down[index] = false;
                 state.last_recv[index] = Some(std::time::Instant::now());
+                if index == state.active {
+                    state.missed = 0;
+                } else {
+                    state.missed = state.missed.saturating_add(1);
+                }
 
                 // Never build a book from deltas alone.
                 if !state.books[index].is_hydrated() {
@@ -225,14 +242,15 @@ impl<W: Write> Consumer<W> {
         }
 
         let active_hydrated = state.books[active].is_hydrated();
-        let lagging = match (
-            state.last_exchange_ts[other],
-            state.last_exchange_ts[active],
-        ) {
-            (Some(new), Some(old)) => (new - old).num_milliseconds() > FAILOVER_LAG_MS,
-            (Some(_), None) => true,
-            _ => false,
-        };
+        let lagging = state.missed >= FAILOVER_MISSED_UPDATES
+            && match (
+                state.last_exchange_ts[other],
+                state.last_exchange_ts[active],
+            ) {
+                (Some(new), Some(old)) => (new - old).num_milliseconds() > FAILOVER_LAG_MS,
+                (Some(_), None) => true,
+                _ => false,
+            };
         let should_switch = !active_hydrated || lagging || state.down[active];
 
         if !should_switch {
